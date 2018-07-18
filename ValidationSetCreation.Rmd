@@ -1,0 +1,785 @@
+---
+title: "Creating a representative validation set"
+author: "Reinhard Sellmair"
+date: "14 July 2018"
+output:
+  html_document:
+    number_sections: yes
+    toc: yes
+    code_folding: hide
+  pdf_document:
+    toc: yes
+---
+
+# Introduction
+
+As almost all classifiers have a tendency to overfit on the training data it is essential to do cross validation and evalutate their performance on a validation data set which was not used to optimise their parameters. There are many possiblities to create a validation data set, whereby it is most common to randomly sample a set from the training data. 
+
+Apart from this, in this kernel I implemented several approaches to create a validation data set and compared the accuracy of different predictors on these sets with the score on the public leader board. 
+
+```{r, message=FALSE, warning = FALSE}
+# load packages
+library(ggplot2)
+library(dplyr)
+library(corrplot)
+library(cowplot)
+library(FNN)
+library(reshape2)
+library(knitr)
+library(e1071)
+library(randomForest)
+library(kableExtra)
+```
+
+# Comparison between training and test data
+
+Before selecting observables from the training data to create the validation set, it is important to check if there are any differences between the training and the test data set. Do do so, I have a look at the value distributions of all features, and compare mean values and correlation matrices of these two data sets. 
+
+The data set I'm using is based on the Titanic data set and was pre-processed in this [kernel](https://www.kaggle.com/reisel/how-to-handle-correlated-features). It contains 1309 observables and 32 features. 
+
+```{r}
+# load data
+passenger <- read.csv("../input/how-to-handle-correlated-features/passenger29F.csv")
+
+# change data types
+passenger$ChildrenId <- as.character(passenger$ChildrenId)
+passenger$ParentsId <- as.character(passenger$ParentsId)
+passenger$ChildrenId <- as.list(passenger$ChildrenId)
+passenger$ParentsId <- as.list(passenger$ParentsId)
+passenger$SameTicketId <- as.list(passenger$SameTicketId)
+
+# remove "X" column
+passenger <- select(passenger, -X)
+
+# convert passenger ids of relatives from character to lists of integers
+for (i in 1:dim(passenger)[1]){
+    passengerSelect <- passenger[i, ]
+    
+    # convert children ids
+    if (!is.na(passengerSelect$ChildrenId)){
+        passengerSelect$ChildrenId <- list(as.numeric(unlist(strsplit(passengerSelect$ChildrenId[[1]], ";"))))
+    } else {
+        passengerSelect$ChildrenId <- NA
+    }
+    # convert parents ids
+    if (!is.na(passengerSelect$ParentsId)){
+        passengerSelect$ParentsId <- list(as.numeric(unlist(strsplit(passengerSelect$ParentsId[[1]], ";"))))
+    } else {
+        passengerSelect$ParentsId <- NA
+    } 
+    # convert same ticket id
+    if (!is.na(passengerSelect$SameTicketId)){
+        passengerSelect$SameTicketId <- list(as.numeric(unlist(strsplit(as.character(passengerSelect$SameTicketId[[1]]), ";"))))
+    } else {
+        passengerSelect$SameTicketId <- NA
+    } 
+    
+    passenger[i, ] <- passengerSelect
+}
+
+# remove unneccesary columns
+passengerOrg <- passenger
+passenger <- select(passenger, -c(SameTicketId, ChildrenId, ParentsId, SpouseId))
+```
+
+## Distributions
+
+```{r}
+# split data between training and test set
+trainingData <- passenger[passenger$DataSet == "Training", ]
+testData <- passenger[passenger$DataSet == "Test", ]
+```
+
+First I compare the age and fare per person distributions. 
+
+```{r, warning = FALSE}
+# continuous values
+# Age, farePerPerson
+p1 <- ggplot(passenger, aes(Age, fill = factor(DataSet))) + 
+    geom_density(alpha = 0.3) + 
+    theme(legend.position = c(0.75, 0.85)) +
+    labs(fill = "Data Set")
+p2 <- ggplot(passenger, aes(FarePerPerson, fill = factor(DataSet))) + 
+    geom_density(alpha = 0.3) + 
+    theme(legend.position = "none") +
+    xlim(0, 50)
+plot_grid(p1, p2, align = 'v', ncol = 1)
+```
+
+The diagrams above show the distribution of the test set in red and the training set in blue. The biggest difference in the age distributions is that the test set contains more passengers of age 20 - 25 while the test data set has more very young passengers (<10 years) and a bit more passengers of age 25 to 40 years. However, these difference are very small. 
+
+The distributions of fare per person are even more similar, there is only a slightly higher percentage of passengers with a fare of 7 in the training than in the test data. 
+
+```{r, fig.height = 18, fig.width = 8}
+# names of features to be ploted
+featureName <- c("Sex_male", "IsChild",
+                 "Pclass", "Pclass_1",
+                 "Title_Mr", "Title_Master", "Title_Mrs", "Title_Rev", 
+                 "Parch", "FamilySize", "ChildrenNumber", "MotherNumber", "SameTicketNumber", 
+                 "HasCabin", "CabinSide_Port", "CabinSide_Unknown",
+                 "DeckNumber", "Deck_A", "Deck_B", "Deck_C", "Deck_E", "Deck_F", 
+                 "MotherSurvivedDiff", "SpouseSurvivedDiff", "MothersChildrenSurvivedDiff", "FathersChildrenSurvivedDiff", "SameTicketSurvivedDiff")
+
+nFeature <- length(featureName)
+
+dataSetNumber <- group_by(passenger, DataSet) %>% summarise(numberDS = n())
+
+# function to create bar plot for selected feature
+plotShareFeature <- function(featureName, showLegend = FALSE){
+    featureNumber <- passenger %>% 
+        group_by_("DataSet", featureName) %>% 
+        summarise(number = n()) %>% 
+        merge(dataSetNumber, by = "DataSet")
+    featureNumber$share <- featureNumber$number / featureNumber$numberDS
+    
+    if (showLegend){
+        legendPosition <- c(0, 0.85)
+    } else {
+        legendPosition <- "none"
+    }
+    
+    p <- ggplot(featureNumber, aes_string(x = featureName, y = "share", fill = "DataSet")) + 
+            geom_bar(stat = "identity", position = position_dodge()) +
+            xlab(featureName) +
+            theme(legend.position = legendPosition)
+    p
+}
+
+pList <- vector("list", nFeature)
+pList[[1]] <- plotShareFeature(featureName[1], TRUE)
+for (i in 2:nFeature){
+    pList[[i]] <- plotShareFeature(featureName[i])
+}
+
+plot_grid(plotlist = pList, ncol = 3)
+```
+
+The distributions of all other features are shown by the diagram above. Most of these features are categorical so that they only have True or False as value. Again, there is almost no difference between the distributions of the test and training set. One of the biggest differences has the deck feature, where lower decks (< 7) have a higher percentage of passengers in the test data, while the training data has a higher share of passengers with deck number 7. 
+
+## Mean value and covariance matrix
+
+Next I calculate the mean value of each features and compare these values between training and test data as well. 
+
+```{r, fig.height = 8, fig.width = 11, message = FALSE, warning = FALSE}
+getFeatureMean <- function(data){
+    # calculate mean value of each feature for test and training data
+    passengerMean <- group_by(data, DataSet) %>% summarise(Sex_male = mean(Sex_male), 
+                                                           IsChild = mean(IsChild), 
+                                                           Pclass = mean(Pclass), 
+                                                           Plcass_1 = mean(Pclass_1), 
+                                                           Title_Mr = mean(Title_Mr), 
+                                                           Title_Master = mean(Title_Master), 
+                                                           Title_Mrs = mean(Title_Mrs), 
+                                                           Title_Rev = mean(Title_Rev), 
+                                                           Parch = mean(Parch), 
+                                                           FamilySize = mean(FamilySize), 
+                                                           ChildrenNumber = mean(ChildrenNumber),  
+                                                           MotherNumber = mean(MotherNumber), 
+                                                           SameTicketNumber = mean(SameTicketNumber), 
+                                                           HasCabin = mean(HasCabin), 
+                                                           CabinSide_Port = mean(CabinSide_Port), 
+                                                           CabinSide_Unknown = mean(CabinSide_Unknown), 
+                                                           DeckNumber = mean(DeckNumber), 
+                                                           Deck_A = mean(Deck_A), 
+                                                           Deck_B = mean(Deck_B), 
+                                                           Deck_C = mean(Deck_C), 
+                                                           Deck_E = mean(Deck_E), 
+                                                           Deck_F = mean(Deck_F), 
+                                                           MotherSurvivedDiff = mean(MotherSurvivedDiff), 
+                                                           SpouseSurvivedDiff = mean(SpouseSurvivedDiff), 
+                                                           MothersChildrenSurvivedDiff = mean(MothersChildrenSurvivedDiff), 
+                                                           FathersChildrenSurvivedDiff = mean(FathersChildrenSurvivedDiff), 
+                                                           SameTicketSurvivedDiff = mean(SameTicketSurvivedDiff),
+                                                           Age = mean(Age), 
+                                                           FarePerPerson = mean(FarePerPerson))
+
+    melt(passengerMean, id.vars = "DataSet")
+}
+
+plotFeatureMean <- function(data, featureExclude = NULL){
+    featureMean <- getFeatureMean(data)
+    if (!is.null(featureExclude)){
+        featureMean <- featureMean[!(featureMean$variable %in% featureExclude), ]
+    }
+
+    ggplot(featureMean, aes(x = factor(variable, levels = rev(unique(variable))), y = value, fill = factor(DataSet))) + 
+        geom_bar(stat = "identity", position = position_dodge()) + 
+        coord_flip() + 
+        xlab("Feature") + 
+        ylab("Mean") + 
+        labs(fill = "Data Set") + 
+        theme(legend.position = c(0.9, 0.9))
+}
+
+par(oma=c(0,0,0,2))
+plotFeatureMean(passenger, c("Age", "FarePerPerson"))
+```
+
+The plot above shows the mean value of each feature for the training and test data. Again, there are almost no differences. The biggest difference appears for the feature SameTicketSurvivedDiff. This feature contains the survival difference (survived = 1, died = -1) of passengers with the same ticket, passengers who traveled alone have a value of 0. The average value of this feature in the training data is -0.10 while the test data has an average of 0.03. Thus, there was a small surplus of people who died with the same ticket, while in the test data, this difference is almost balanced. 
+
+Next, I have a look at the correlation of features. Therefore, I calculate the correltation coefficient of each feature with all other features and arrange all factors in a matrix. The diagrams below shows all correlation coefficients while positive correlations are blue, negative correlations are red and no correlations are white. 
+
+```{r, fig.height = 8, fig.width = 8}
+# function to calculate plot feature correlation matrix
+getCorrMatrix <- function(data, showPlot = TRUE, title = ""){
+    # calculate correlation matrix
+    corrMatrix <- cor(data)
+    # plot matrix
+    if (showPlot) {corrplot(corrMatrix, method = "color", type = "upper", title = title, mar = c(0, 0, 1, 0))}
+    corrMatrix
+}
+
+corrTraining <- getCorrMatrix(trainingData[, c("Age", "FarePerPerson", featureName)], title = "Training")
+corrTest <- getCorrMatrix(testData[, c("Age", "FarePerPerson", featureName)], title = "Test")
+```
+
+Both matrices show that following features are strongly correlated: 
+
+* Pclass, Pclass_1, FarePerPerson
+* Parch, FamilySize, ChildrenNumber, MotherNumber
+* Pclass, Pclass_1, HasCabin, CabinSide_Port, CabinSide_Unknown
+
+Pclass contains the number of the passengers' class (1-3) while Pclass_1 is its the one-hot encoded feature for Pclass = 1. Logicly, these features are strongly correlted. As passengers had to pay more for upper classes there is also a strong correlation between Pclass and FarePerPerson. 
+
+Its also no surprise that the features Parch (number of parents + number of children), FamilySize (total number of family members), ChildrenNumber and MotherNumber are strongly correlated. 
+
+The correlation between Pclass and the features HasCabin, CabinSide_Port, CabinSide_Unknown can be explained as the cabin feature was mainly populated for first class passengers only, while this feature was missing for almost all third class passengers. 
+
+Since the training and test correlation matrices look very similar I show the difference of these matrices in the next plot. 
+
+```{r, fig.height = 8, fig.width = 8}
+corrDiff <- corrTraining - corrTest
+corrplot(corrDiff, method = "color", type = "upper", title = "Training - Test", mar = c(0, 0, 1, 0))
+```
+
+This matrix shows that the training and test data correlation matrices are very similar. The average difference over all correlation coefficients is -0.007. There are only slight differences regarding the correlation of the survival diff features (MotherSurvivedDiff, SpouseSurvivedDiff, MothersChildrenSurvivedDiff, FathersChildrenSurvivedDiff, SameTicketSurvivedDiff) with the family size features (Parch, FamilySize, ChildrenNumber, MotherNumber, SameTicketNumber).
+
+In summary it can be said that the training and test set are very similar. This is a good basis to extract a representative validation data set from the training data. 
+
+# Creation of validation data
+
+In this section I apply five different method to generate the validation data set. The validation set shall consist of 20% of the observalbes of the training data which means that 178 samples shall be selected. 
+
+## Random sampling
+
+Certainly, the most common way to generate validation data is to randomly sample from the training data. I creaste three different randomly sampled validation sets to evalute the differences among them later. 
+
+```{r}
+# number of observables in validation set
+nVal <- round(0.2* nrow(trainingData))
+
+# create 3 validation data sets via random sampling
+set.seed(0)
+valRand1 <- sample_n(trainingData, size = nVal)
+valRand2 <- sample_n(trainingData, size = nVal)
+valRand3 <- sample_n(trainingData, size = nVal)
+```
+
+## Nearest neighbor
+
+Another way is to search for the nearest neighbor. Here, I take one observable (passenger) of the test set at a time and select its nearest neighbor from the training set to move it to the validation set. Therewith, I want to achieve that the observables in the validation set are as similar as possible to the observables of the test set. 
+I use two different versions: sample with replacement (NNDub) and sample without replacement (NNUn). When I sample with replacement, the same observable can be move several times to the validation set. Hence, the validation set can contain duplicate observables while without replacement all observalbes of the validation set are unique. 
+
+```{r}
+# normalise data
+passengerNorm <- passenger
+# remove features which shall not be normed
+passengerNorm <- select(passengerNorm, -c(PassengerId, DataSet, Survived))
+# normalise each column
+for (i in 1:ncol(passengerNorm)){
+    colMin <- min(passengerNorm[, i])
+    colMax <- max(passengerNorm[, i])
+    passengerNorm[, i] <- (passengerNorm[, i] - colMin) / (colMax - colMin)
+}
+
+# split data set in training and test
+trainingNorm <- passengerNorm[passenger$DataSet == "Training", ]
+testNorm <- passengerNorm[passenger$DataSet == "Test", ]
+
+# get nearest neigbor of sampled test set in training set
+nn <- get.knnx(trainingNorm, testNorm, k = 1)
+
+# get passenger ids of training set
+passengerIdTraining <- passenger$PassengerId[passenger$DataSet == "Training"]
+# get passenger ids of nearest neighbors
+passengerIdNN <- passengerIdTraining[nn$nn.index]
+
+# sample nVal passenger IDs (containing duplicates)
+set.seed(0)
+passengerIdDub <- sample(passengerIdNN, nVal)
+# sample nVal unique passenger IDs
+passengerIdUn <- sample(unique(passengerIdNN), nVal)
+
+# create validation data sets
+valNNDub <- passenger[passengerIdDub, ]
+valNNUn <- passenger[passengerIdUn, ]
+```
+
+```{r}
+table(table(passengerIdDub))
+```
+
+The validation data set which was sampled with replacement contains 128 unique observables, 18 observables appear twice, 3 three times and one five times. 
+
+## Mean value selection
+
+The idea of this approach is to select samples so that the average value of each feature is as similar as possible compared to the test data. To do so, the first obeservable is randomly selected from the training set. Following, another observable is selected from the training data and added to the validation data. For this data set, the average of each feature is calculated and compared with the test data. The difference is calculated for each observable of the training set. Next, the observable with the smallest difference is selected. This process is repeated until the validation data set reached the required number of observables. As the features have different magnitudes, all features are normalised. 
+
+```{r}
+# select validation set so that mean values of each feature are as similar as possible to test data
+passengerIdPool <- passengerIdTraining
+
+# calculate mean value of test set
+testMean <- colMeans(testNorm)
+
+# find passenger in training set closest to test means
+meanDiff <- rowSums((trainingNorm - replicate(nrow(trainingNorm), testMean)) ^ 2)
+
+# get index with lowest difference
+indexMin <- which.min(meanDiff)
+meanDiffAll <- rep(NA, nVal)
+meanDiffAll[1] <- meanDiff[indexMin]
+
+# select passenger
+passengerIdSelect <- passengerIdPool[indexMin]
+
+# sum of all selected passenger
+valSum <- as.numeric(trainingNorm[indexMin, ])
+
+# remove passenger from training set
+trainingRem <- as.matrix(trainingNorm[-indexMin, ])
+passengerIdPool <- passengerIdPool[-indexMin]
+
+# select following passengers
+for (i in 2:nVal){
+    nRem <- nrow(trainingRem)
+    # calculate difference to test set
+    meanDiff <- rowSums(((trainingRem + matrix(rep(valSum, each = nRem), nrow = nRem)) / i - 
+                            matrix(rep(testMean, each = nRem), nrow = nRem)) ^2)
+    
+    # get index with lowest difference
+    indexMin <- which.min(meanDiff)
+    meanDiffAll[i] <- meanDiff[indexMin]
+    
+    # get passegner Id
+    passengerIdSelect <- c(passengerIdSelect, passengerIdPool[indexMin])
+    
+    # sum of all selected passengers
+    valSum <- valSum + trainingRem[indexMin, ]
+    
+    # remove passenger from training set
+    trainingRem <- trainingRem[-indexMin, ]
+    passengerIdPool <- passengerIdPool[-indexMin]
+}
+
+# create data set
+valMean <- passenger[passengerIdSelect, ]
+```
+
+## Covariance selection
+
+This approach is very similar to the mean value selection above. The difference here is that instead of calculating and comparing the mean value of each feature, a covariance matrix is calculated after adding another observable to the validation set. The observable which leads to the smallest difference between the covariance matrix of the validation and test data is selected.  
+
+```{r, warning = FALSE}
+# select passengers by comparing covariance matrices
+
+# calculate correaltion matrix of test set
+corrTest <- getCorrMatrix(testData[, c("Age", "FarePerPerson", featureName)], showPlot = FALSE)
+
+# get remaining training set and passenger IDs
+trainingRem <- trainingData
+passengerIdPool <- passengerIdTraining
+
+# select first two passenger randomly
+set.seed(1)
+nSelect <- 1
+iSelect <- sample(1:nrow(trainingData), nSelect)
+valCorr <- trainingRem[iSelect, ]
+passengerIdSelect <- passengerIdPool[iSelect]
+
+# remove passenger
+passengerIdPool <- passengerIdPool[-iSelect]
+trainingRem <- trainingRem[-iSelect, ]
+
+corrDiffAll <- rep(NA, nVal - nSelect)
+
+for (iVal in (nSelect + 1):(nVal)){
+    # calculate correlation matrix for each passenger
+    nRem <- nrow(trainingRem)
+    corrDiff <- rep(NA, nRem)
+    for (iRem in 1:nRem){
+        valAdd <- rbind(valCorr, trainingRem[iRem, ])
+        
+        corrI <- getCorrMatrix(valAdd[, c("Age", "FarePerPerson", featureName)], showPlot = FALSE)  
+        corrI[is.na(corrI)] <- 0
+        corrDiff[iRem] <- sum((corrTest - corrI) ^ 2)
+    }
+    
+    # get index with lowest difference
+    indexMin <- which.min(corrDiff)
+    corrDiffAll[iVal] <- corrDiff[indexMin]
+    
+    # get passegner Id
+    passengerIdSelect <- c(passengerIdSelect, passengerIdPool[indexMin])
+    
+    # sum of all selected passengers
+    valCorr <- rbind(valCorr, trainingRem[indexMin, ])
+    
+    # remove passenger from training set
+    trainingRem <- trainingRem[-indexMin, ]
+    passengerIdPool <- passengerIdPool[-indexMin]
+}
+```
+
+## Selection via prediction
+
+Another idea is to try to predict the data set. Therefore, I use all features (except survival) to calculate the probability if an observable belongs to the training set. The observables of the training set with the lowest probability are moved to the validation set. This method could be usefull if there is a bias between training and test data.
+
+```{r}
+# predict if data point origins from training or test set
+dataPred <- select(passenger, -c(PassengerId, Survived))
+model <- glm(DataSet~. , data = dataPred, family = binomial())
+prob <- predict.glm(model, dataPred, type = "response")
+
+setPred <- data.frame(DataSet = passenger$DataSet, Probability = prob, PassengerId = passenger$PassengerId)
+
+# order data with respect to probability 
+setPred <- setPred[order(setPred$Probability), ]
+
+# get ids of passengers in training data with lowest probabilities
+passengerIdSelect <- setPred$PassengerId[setPred$DataSet == "Training"]
+passengerIdSelect <- passengerIdSelect[1:nVal]
+
+# get validation data set
+valPredTest <- passenger[passenger$PassengerId %in% passengerIdSelect, ]
+```
+
+The histogram below shows the calculated probabilities of test and training set data, the countes of the test set are lower as it contains less observables. The histogram shows that the probability distributions of the training and test set are almost identical. Hence, the predictor was not able to distinguish between training and test data. As a consequence, it is expectable that the validation set created with this method is not representative.
+
+```{r, message = FALSE}
+ggplot(setPred, aes(fill = factor(DataSet, levels = c("Training", "Test")), x = Probability)) + 
+    geom_histogram(position = "identity", alpha = 0.5) +
+    labs(fill = "Data Set")
+```
+
+# Comparison between validation and test data
+
+In this section I make a comparison between the created validation data sets. First, I analyse the average values of each feature, following, I compare the coveriance matrices of each set with the test data. 
+
+## Mean value 
+
+I normalise all features and calculate their average for each validation set and compare it with the training set. The graph below shows the result of each feature for all data sets. The set with the highest deviation from the test set is PredTest (created by predicting the test set). Females are overrepresented in this data set so that there is a big deviation for the features Sex_male, TitleMr, and Title_Mrs. 
+The mean values of all other data sets fit much better to the test set, whereby the Mean validation set has the smallest deviations which is not surprising as this set was created to minimise the deviation of mean values. 
+
+```{r, fig.height = 12, fig.width = 12}
+# change names of DataSet 
+valRand1$DataSet <- "Rand 1"
+valRand2$DataSet <- "Rand 2"
+valRand3$DataSet <- "Rand 3"
+valNNDub$DataSet <- "NNDub"
+valNNUn$DataSet <- "NNUn"
+valMean$DataSet <- "Mean"
+valCorr$DataSet <- "Corr"
+valPredTest$DataSet <- "PredTest"
+
+# combine test, and validation sets
+dataComb <- do.call("rbind", list(testData, valRand1, valRand2, valRand3, valNNDub, valNNUn, valMean, valCorr, valPredTest))
+
+# features to be excluded from normalisation
+featureNormEx <- c("DataSet", "PassengerId", "Survived")
+
+# normalise data sets
+dataCombNorm <- dataComb
+for (i in which(!(names(passenger) %in% featureNormEx))){
+    fMin <- min(passenger[, i])
+    fMax <- max(passenger[, i])
+    dataCombNorm[, i] <- (dataCombNorm[, i] - fMin) / (fMax - fMin)
+}
+
+# plot mean values of features
+par(oma=c(0,0,0,2))
+plotFeatureMean(dataCombNorm)
+```
+
+The table below lists the relative deviation of the validation sets' mean values from the test set's mean values. The avreage values of all randomly selected validation sets deviate by 13 - 14% from the test set. The Mean validation set has with 2% the smallest deviation, while the Corr and PredTest set have the highest deviation with 22, respectively 39%. 
+
+```{r}
+dataCombMean <- getFeatureMean(dataCombNorm)
+testMean <- filter(dataCombMean, DataSet == "Test")
+dataMerge <- merge(dataCombMean, testMean, by.x = "variable", by.y = "variable")
+meanDev <- dataMerge[, c("variable", "DataSet.x")]
+meanDev$dev <- abs(dataMerge$value.x - dataMerge$value.y) / dataMerge$value.y
+
+
+kable((meanDev %>% group_by(DataSet.x) %>% summarise(mean(dev)))[2:9, ]) %>% kable_styling(full_width = F)
+```
+
+## Covariance matrix
+
+Next I calculated the covariance matrix of each data set and substracted them from the test set correlation matrix. All matrices are shown below. 
+
+```{r, fig.height = 8, warning = FALSE}
+# valRand1, valRand2, valRand3, valNNDub, valNNUn, valMean, valCorr
+# get correlation matrix of each data set
+corrRand1 <- getCorrMatrix(valRand1[, c("Age", "FarePerPerson", featureName)], showPlot = FALSE)
+corrRand2 <- getCorrMatrix(valRand2[, c("Age", "FarePerPerson", featureName)], showPlot = FALSE)
+corrRand3 <- getCorrMatrix(valRand3[, c("Age", "FarePerPerson", featureName)], showPlot = FALSE)
+corrNNDub <- getCorrMatrix(valNNDub[, c("Age", "FarePerPerson", featureName)], showPlot = FALSE)
+corrNNUn <- getCorrMatrix(valNNUn[, c("Age", "FarePerPerson", featureName)], showPlot = FALSE)
+corrMean <- getCorrMatrix(valMean[, c("Age", "FarePerPerson", featureName)], showPlot = FALSE)
+corrCorr <- getCorrMatrix(valCorr[, c("Age", "FarePerPerson", featureName)], showPlot = FALSE)
+corrPredTest <- getCorrMatrix(valPredTest[, c("Age", "FarePerPerson", featureName)], showPlot = FALSE)
+
+# calculate difference to test correlation matrix
+diffRand1 <- corrRand1 - corrTest
+diffRand2 <- corrRand2 - corrTest
+diffRand3 <- corrRand3 - corrTest
+diffNNDub <- corrNNDub - corrTest
+diffNNUn <- corrNNUn - corrTest
+diffMean <- corrMean - corrTest
+diffCorr <- corrCorr - corrTest
+diffPredTest <- corrPredTest - corrTest
+
+# set NAs to zeros
+diffRand1[is.na(diffRand1)] <- 0
+diffRand2[is.na(diffRand2)] <- 0
+diffRand3[is.na(diffRand3)] <- 0
+diffNNDub[is.na(diffNNDub)] <- 0
+diffNNUn[is.na(diffNNUn)] <- 0
+diffMean[is.na(diffMean)] <- 0
+diffCorr[is.na(diffCorr)] <- 0
+diffPredTest[is.na(diffPredTest)] <- 0
+
+par(mfrow = c(3, 3))
+corrplot(diffRand1, method = "color", tl.pos = "n", title = "Rand 1", mar = c(0, 0, 1, 0))
+corrplot(diffRand2, method = "color", tl.pos = "n", title = "Rand 2", mar = c(0, 0, 1, 0))
+corrplot(diffRand3, method = "color", tl.pos = "n", title = "Rand 3", mar = c(0, 0, 1, 0))
+corrplot(diffNNDub, method = "color", tl.pos = "n", title = "NN Dub", mar = c(0, 0, 1, 0))
+corrplot(diffNNUn, method = "color", tl.pos = "n", title = "NN Un", mar = c(0, 0, 1, 0))
+corrplot(diffMean, method = "color", tl.pos = "n", title = "Mean", mar = c(0, 0, 1, 0))
+corrplot(diffCorr, method = "color", tl.pos = "n", title = "Corr", mar = c(0, 0, 1, 0))
+corrplot(diffPredTest, method = "color", tl.pos = "n", title = "Pred Test", mar = c(0, 0, 1, 0))
+```
+
+It can be seen that espcially the Rand 1, Mean, and Pred Test correlation matrices significant deviate from the test set. Rand 2, Rand 3, NN Dub, NN Un have moderate deviations while the Corr validation set deviates the least from the test set. This is not a surprise as the Corr set was optimised to have a small deviation from the test set. 
+
+It is interesting to see that all sets, except Pred Test and Corr show similar patterns of correlation deviations. The feature correlation pairs with the highest deviation from the test data are survival difference features (MothersChildrenSurvivedDiff, FathersChildrenSurvivedDiff, and SameTicketSurvivedDiff) with family size features (ChildrenNumber, Parch, and FamilySize). These are the same features which also deviated between the training and test sets. Hence, most validation sets inherited these deviations from the trainin set. 
+
+The table below lists the average correlation difference between the validation sets and the test set. 
+
+```{r}
+# names of data sets
+dataName <- c("Rand 1", "Rand 2", "Rand 3", "NN Dub", "NN Un", "Mean", "Corr", "Pred Test")
+
+# calculate average correlation difference
+avgCorrDiff <- data.frame(name = dataName, 
+                          value = c(mean(abs(diffRand1)), mean(abs(diffRand2)), mean(abs(diffRand3)), mean(abs(diffNNDub)), mean(abs(diffNNUn)), mean(abs(diffMean)), mean(abs(diffCorr)), mean(abs(diffPredTest))))
+
+kable(avgCorrDiff) %>% kable_styling(full_width = F)
+```
+
+# Prediction
+
+In this part I evaluate how reproducible the crated validation sets are. Therefore, I train three different predictors (Logistic Regression, Support Vector Machine, and Random Forest) and calculate their accuracy on the validation data sets. To compare these accuracies, I also make predictions on the test data set, submit them, and retrieve the score on the public leader board. I assume that a validation set is representative when its accuracy is as similar as possible to the public score.
+
+```{r}
+# combine validation data sets in a list
+valData <- list(valRand1, valRand2, valRand3, valNNDub, valNNUn, valMean, valCorr, valPredTest)
+nValData <- length(valData)
+
+# create complementing training sets of each validation set
+trainData <- vector("list", nValData)
+for (iVal in 1:nValData){
+    trainData[[iVal]] <- trainingData[!(trainingData$PassengerId %in% valData[[iVal]]$PassengerId), ]
+}
+```
+
+## Logistic Regression (LR)
+
+```{r, warning = FALSE}
+# fit logistic regression on training data, calculate accuracy on validation data, predict test data
+accVal <- rep(NA, nValData)
+for (iVal in 1:nValData){
+    # fit model
+    model <- glm(as.factor(Survived)~. , data = select(trainData[[iVal]], -c(PassengerId, DataSet)), family = binomial())
+
+    # predict survival on validation set
+    predVal <- as.numeric(predict.glm(model, valData[[iVal]], type = "response") > 0.5)
+    # calculate accuracy
+    accVal[iVal] <- mean(predVal == valData[[iVal]]$Survived)
+    
+    # predict survival on test set
+    predTest <- as.numeric(predict.glm(model, testData, type = "response") > 0.5)   
+    
+    # create csv file with test prediction
+    fileName <- paste0("solutionLR", dataName[iVal], ".csv")
+    # create data frame for submission
+    df <- data.frame(PassengerId = testData$PassengerId, Survived = predTest)
+    # submit prediction 
+    write.csv(df, fileName, row.names = FALSE)
+}
+
+# create data frame with results
+result <- data.frame(predictor = rep("LR", nValData), 
+                     dataName = dataName, 
+                     valAcc = accVal, 
+                     score = c(0.77511, 0.77511, 0.77990, 0.78947, 0.78947, 0.76555, 0.79425, 0.75598))
+```
+
+## Support Vector Machines (SVM)
+
+```{r}
+# fit SVM on training data, calculate accuracy on validation data, predict test data
+accVal <- rep(NA, nValData)
+for (iVal in 1:nValData){
+    # fit model
+    model <- svm(select(trainData[[iVal]], -c(Survived, PassengerId, DataSet)), as.factor(trainData[[iVal]]$Survived), scale = TRUE)
+
+    # predict survival on validation set
+    predVal <- as.numeric(predict(model, select(valData[[iVal]], -c(Survived, PassengerId, DataSet)))) - 1
+    # calculate accuracy
+    accVal[iVal] <- mean(predVal == valData[[iVal]]$Survived)
+    
+    # predict survival on test set
+    predTest <- as.numeric(predict(model, select(testData, -c(Survived, PassengerId, DataSet)))) - 1
+    
+    # create csv file with test prediction
+    fileName <- paste0("solutionSVM", dataName[iVal], ".csv")
+    # create data frame for submission
+    df <- data.frame(PassengerId = testData$PassengerId, Survived = predTest)
+    # submit prediction
+    write.csv(df, fileName, row.names = FALSE)
+}
+
+# create data frame with results
+resultAdd <- data.frame(predictor = rep("SVM", nValData), 
+                        dataName = dataName, 
+                        valAcc = accVal, 
+                        score = c(0.79904, 0.78947, 0.79425, 0.80861, 0.80382, 0.78947, 0.80861, 0.78468))
+result <- rbind(result, resultAdd)
+```
+
+## Random Forest (RF)
+
+```{r}
+# fit Random Forest on training data, calculate accuracy on validation data, predict test data
+accVal <- rep(NA, nValData)
+for (iVal in 1:nValData){
+    # fit model
+    model <- randomForest(select(trainData[[iVal]], -c(Survived, PassengerId, DataSet)), as.factor(trainData[[iVal]]$Survived))
+
+    # predict survival on validation set
+    predVal <- as.numeric(predict(model, select(valData[[iVal]], -c(Survived, PassengerId, DataSet)))) - 1
+    # calculate accuracy
+    accVal[iVal] <- mean(predVal == valData[[iVal]]$Survived)
+    
+    # predict survival on test set
+    predTest <- as.numeric(predict(model, select(testData, -c(Survived, PassengerId, DataSet)))) - 1
+    
+    # create csv file with test prediction
+    fileName <- paste0("solutionRF", dataName[iVal], ".csv")
+    # create data frame for submission
+    df <- data.frame(PassengerId = testData$PassengerId, Survived = predTest)
+    # submit prediction
+    write.csv(df, fileName, row.names = FALSE)
+}
+
+# create data frame with results
+resultAdd <- data.frame(predictor = rep("RF", nValData), 
+                        dataName = dataName, 
+                        valAcc = accVal, 
+                        score = c(0.79425, 0.77511, 0.76555, 0.77990, 0.80382, 0.77511, 0.77990, 0.76555))
+result <- rbind(result, resultAdd)
+```
+
+# Evaluation
+
+The diagram below shows the difference between validation and test score of each validation data set and predictor. The average difference over all data set and predictors is listed in the tables below. 
+
+```{r}
+# calculate difference between validation accuracy and score
+result$diff <- abs(result$valAcc - result$score)
+
+# plot differences per data set and predictor
+ggplot(result, aes(x = as.factor(dataName), y = diff, fill = as.factor(predictor))) + 
+    geom_bar(stat = "identity", , position = position_dodge()) + 
+    labs(fill = "Predictor") +
+    xlab("Data Set") + 
+    ylab("Difference") + 
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r}
+# calcualte average difference per data set
+avgScoreDiff <- result %>% group_by(dataName) %>% summarise(mean(diff))
+kable(avgScoreDiff) %>% kable_styling(full_width = F) 
+kable(result %>% group_by(predictor) %>% summarise(mean(diff))) %>% kable_styling(full_width = F)
+```
+
+The average score difference of the Corr validation set is the lowest, on average the deviation is 1.5%. The next best sets are NN Un and Rand 3 with a deviation of 2.3%. There is quite a difference between the randomly selected data sets: Rand 1 has a deviation of 5.9% and Rand 2 4.2%. Clearly the worst set is Pred Test with a deviation of 9.6% which is no surprise as it was not possible to predict if an observable belongs to the test or training set. 
+
+Furthermore, the results show that there are significant differences regarding the predictor. For Support Vector Machine (SVM) the average score difference was 3.0% while Random Forest had a difference of 5.4%. 
+
+```{r}
+# combine correlation and score difference
+scoreDiffCorr <- merge(avgCorrDiff, avgScoreDiff, by.x = "name", by.y = "dataName")
+# rename columns
+names(scoreDiffCorr)[1] <- "dataSet"
+names(scoreDiffCorr)[2] <- "corrDiff"
+names(scoreDiffCorr)[3] <- "scoreDiff"
+
+ggplot(scoreDiffCorr, aes(x = corrDiff, y = scoreDiff)) + 
+    geom_point() + 
+    stat_smooth(method = "lm") + 
+    geom_label(label = scoreDiffCorr$dataSet, nudge_x = 0.0075, nudge_y = 0) +
+    xlim(0, 0.1) +
+    ylim(0, 0.1)
+```
+
+As the Corr validation set performed best, it seems that having similar correlations of the features in the validation and the test set is an important criteria to reproduce similar scores. To have a deeper look at that, I ploted the difference of the validation score and test score with respect to the difference of the validation and test set correlation matrices. 
+
+It shows a clear correlation between these factors. The only outliers are Rand 3 and Pred Test. When we analysed the validation sets' mean values we saw already that Pred Test had very strong deviations compared to the other data sets. I believe that these differences had a negative effect on the validation accuracy but could not be completely covered by the correlation matrix. It is difficult to say why Rand 3 is an outlier, since Rand 1 and 2 are very close to the regression line. 
+
+# Conclusion
+
+In this kernel I created and tested different validation data sets. The goal was to create a data set which allows to reproduce scores on the test set as good as possible. It turned out that similarities between the corrlation matrices of the validation and test set is an important criteria to reproduce test scores as well as possible. I created a validation set which was optimised on this criteria. This data set is given as output of this kernel. 
+
+```{r}
+# create output data set 
+passengerOutput <- passengerOrg
+passengerOutput$DataSet <- as.character(passengerOutput$DataSet)
+passengerOutput$DataSet[passengerOutput$PassengerId %in% valCorr$PassengerId] <- "Validation"
+
+# replace empty integers by NA
+passengerOutput$SpouseId[sapply(passengerOrg$SpouseId, length) == 0] <- NA
+passengerOutput$ChildrenId[sapply(passengerOrg$ChildrenId, length) == 0] <- NA
+passengerOutput$ParentsId[sapply(passengerOrg$ParentsId, length) == 0] <- NA
+passengerOutput$SameTicketId[passengerOrg$SameTicketNumber == 1] <- NA
+
+# replace lists by comma separated strings
+for (i in 1:nrow(passengerOutput)){
+    if (length(passengerOutput$ChildrenId[[i]]) > 1){
+        passengerOutput$ChildrenId[i] <- paste(as.character(passengerOutput$ChildrenId[[i]]), collapse = ";")
+    }
+    if (length(passengerOutput$ParentsId[[i]]) > 1){
+        passengerOutput$ParentsId[i] <- paste(as.character(passengerOutput$ParentsId[[i]]), collapse = ";")
+    }
+    if (length(passengerOutput$SameTicketId[[i]]) > 1){
+        passengerOutput$SameTicketId[i] <- paste(as.character(passengerOutput$SameTicketId[[i]]), collapse = ";")
+    }    
+}
+
+# convert lists to characters
+passengerOutput$SpouseId <- as.character(passengerOutput$SpouseId)
+passengerOutput$ChildrenId <- as.character(passengerOutput$ChildrenId)
+passengerOutput$ParentsId <- as.character(passengerOutput$ParentsId)
+passengerOutput$SameTicketId <- as.character(passengerOutput$SameTicketId)
+
+# order by passenger id
+passengerOutput <- passengerOutput[order(passengerOutput$PassengerId), ]
+
+# save passenger data set
+write.csv(passengerOutput, file = "passengerValidation.csv")
+```
+
+Another important aspect is that the reproducibility also depends on the predictor. I applied logistic regression, support vector machines and random forest classifiers on the validation data set. Thereby, I found out that the difference between validation and test score was the lowest for support vector machines, while random forest had the highest difference. 

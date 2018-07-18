@@ -1,0 +1,1376 @@
+---
+title: "Iterative Prediction of Survival and hyperparameter tuning"
+author: "Reinhard Sellmair"
+#date: "19 May 2018"
+output:
+  html_document:
+    number_sections: yes
+    toc: yes
+    code_folding: hide
+  pdf_document:
+    toc: yes
+---
+
+Last update on 10.6.2018: added Random Forest Classifier
+
+# Introduction
+
+In this kernel I'm predicting the survival of passengers on the Titanic. In contrast to most other kernels I'm using the survival information of other passengers as feature. Therewith, survival information of all passengers' relatives which were on board is taken into account. Obviously, since the survival of not all passengers is known I propose an iterative process where the survival features are updated after each prediction iteration. 
+
+I start with logistic regression and will add different classifier in future versions of this kernel. For each classifier I do some hyper-parameter tuning in order to obtain the best results.
+
+# Preparation
+
+## Loading of data
+
+I described the extraction of family relations and the feature engineering in [Save the Families!]( https://www.kaggle.com/reisel/save-the-families) and [Imputation and Feature Engineering](https://www.kaggle.com/reisel/imputation-and-feature-engineering/notebook).
+
+```{r, message=FALSE, warning = FALSE}
+# load packages
+library(dplyr)
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+
+# logistic regression with regularisation
+library(glmnet)
+# knn classifier
+library(FNN)
+# naive bayes classifier and SVM
+library(e1071)
+# decision tree
+library(rpart)
+# random foreset
+library(randomForest)
+```
+
+```{r}
+
+# load data
+passenger <- read.csv("../input/imputation-and-feature-engineering/passenger.csv")
+
+# change data types
+passenger$Name <- as.character(passenger$Name)
+passenger$Ticket <- as.character(passenger$Ticket)
+passenger$Cabin <- as.character(passenger$Cabin)
+passenger$Surname <- as.character(passenger$Surname)
+passenger$MaidenName <- as.character(passenger$MaidenName)
+passenger$Firstname <- as.character(passenger$Firstname)
+passenger$SiblingId <- as.character(passenger$SiblingId)
+passenger$ChildrenId <- as.character(passenger$ChildrenId)
+passenger$ParentsId <- as.character(passenger$ParentsId)
+passenger$HusbandFirstname <- as.character(passenger$HusbandFirstname)
+passenger$SiblingId <- as.list(passenger$SiblingId)
+passenger$ChildrenId <- as.list(passenger$ChildrenId)
+passenger$ParentsId <- as.list(passenger$ParentsId)
+passenger$SameTicketId <- as.list(passenger$SameTicketId)
+
+# remove "X" column
+passenger <- select(passenger, -X)
+
+# convert passenger ids of relatives from character to lists of integers
+for (i in 1:dim(passenger)[1]){
+    passengerSelect <- passenger[i, ]
+    
+    # convert sibling ids
+    if (!is.na(passengerSelect$SiblingId)){
+        passengerSelect$SiblingId <- list(as.numeric(unlist(strsplit(passengerSelect$SiblingId[[1]], ";"))))
+    } else {
+        passengerSelect$SiblingId <- NA
+    }
+    # convert children ids
+    if (!is.na(passengerSelect$ChildrenId)){
+        passengerSelect$ChildrenId <- list(as.numeric(unlist(strsplit(passengerSelect$ChildrenId[[1]], ";"))))
+    } else {
+        passengerSelect$ChildrenId <- NA
+    }
+    # convert parents ids
+    if (!is.na(passengerSelect$ParentsId)){
+        passengerSelect$ParentsId <- list(as.numeric(unlist(strsplit(passengerSelect$ParentsId[[1]], ";"))))
+    } else {
+        passengerSelect$ParentsId <- NA
+    } 
+    # convert same ticket id
+    if (!is.na(passengerSelect$SameTicketId)){
+        passengerSelect$SameTicketId <- list(as.numeric(unlist(strsplit(as.character(passengerSelect$SameTicketId[[1]]), ";"))))
+    } else {
+        passengerSelect$SameTicketId <- NA
+    } 
+    
+    passenger[i, ] <- passengerSelect
+}
+```
+
+This data set contains many columns which were only used for its construction. To have a more tidy set, I keep only the columns which I use for the prediction. 
+
+```{r}
+# remove columns
+passenger <- select(passenger, -c(Name, 
+                                  Ticket, 
+                                  Fare, 
+                                  Cabin, 
+                                  Embarked, 
+                                  Surname, 
+                                  MaidenName, 
+                                  Firstname, 
+                                  HusbandFirstname, 
+                                  SiblingAgeMin, 
+                                  SiblingAgeMax, 
+                                  SiblingAgeMean, 
+                                  ParentAgeMin, 
+                                  ParentAgeMax, 
+                                  ParentAgeMean, 
+                                  ChildrenAgeMin, 
+                                  ChildrenAgeMax, 
+                                  ChildrenAgeMean, 
+                                  SameTicketAgeMin, 
+                                  SameTicketAgeMax, 
+                                  SameTicketAgeMean, 
+                                  SpouseAge, 
+                                  CabinNr))
+
+# add feature about survival of passengers with same ticket
+passenger$SameTicketSurvivedDiff <- NA
+
+```
+
+## Helper functions
+
+Next, I create several functions which are later used for the data handling.
+
+First, I create a function which is used to update the passengers' survival features (SpouseSurvivedDiff, SiblingSurvivedDiff, ChildrenSurvivedDiff, ParentsSurvivedDiff, FatherSurvivedDiff, MotherSurvivedDiff, RelativesSurvivedDiff, and SameTicketSurvivedDiff) with respect to the prediction. These features contain the difference of survived minus not survived relatives, e.g. if a passenger's spouse survived its value is 1, if he or she didn't survived its -1 and if the passengers didn't have a spouse aboard, the value is 0. If the spouse's survival is not known (because the passenger is in the test data set), the value is NA.
+
+```{r}
+# function to update survival features of all passengers
+updateSurvivalFeatures <- function(passenger){
+    # number of passengers
+    nPassenger <- dim(passenger)[1]
+    # transform survived feature to -1 or 1
+    survived <- passenger$Survived * 2 - 1
+    # set survival differences to NA
+    passenger$SameTicketSurvivedDiff <- NA
+    passenger$SpouseSurvivedDiff <- NA
+    passenger$SiblingSurvivedDiff <- NA
+    passenger$ChildrenSurvivedDiff <- NA
+    passenger$ParentsSurvivedDiff <- NA
+    passenger$FatherSurvivedDiff <- NA
+    passenger$MotherSurvivedDiff <- NA
+
+    for (iPassenger in 1:nPassenger){
+        passengerSelect <- passenger[iPassenger, ]
+        
+        # survival of spouse
+        if (passengerSelect$SpouseNumber == 1){
+            passengerSelect$SpouseSurvivedDiff <- survived[passengerSelect$SpouseId]
+        } else {
+            passengerSelect$SpouseSurvivedDiff <- 0
+        }
+        
+        # survival of siblings
+        passengerSelect$SiblingSurvivedDiff <- 
+            sum(survived[passenger$PassengerId %in% unlist(passengerSelect$SiblingId)])
+        
+        # survival of children
+        passengerSelect$ChildrenSurvivedDiff <- 
+            sum(survived[passenger$PassengerId %in% unlist(passengerSelect$ChildrenId)])    
+        
+        # survival of parents
+        passengerSelect$ParentsSurvivedDiff <- 
+            sum(survived[passenger$PassengerId %in% unlist(passengerSelect$ParentsId)])    
+
+        # survival of passengers with same ticket
+        passengerSelect$SameTicketSurvivedDiff <- 
+            sum(survived[passenger$PassengerId %in% unlist(passengerSelect$SameTicketId)])        
+        
+        # survival of mother and father
+        if (passengerSelect$ParentsNumber > 0){
+            # get parents
+            parents <- passenger[passenger$PassengerId %in% unlist(passengerSelect$ParentsId), ]
+            # survival of father
+            if (passengerSelect$FatherNumber == 1){
+                father <- parents[parents$Sex == 'male', ]
+                passengerSelect$FatherSurvivedDiff <- father$Survived * 2 - 1
+            } else {
+                passengerSelect$FatherSurvivedDiff <- 0 
+            }
+            # survival of mother
+            if (passengerSelect$MotherNumber == 1){
+                mother <- parents[parents$Sex == 'female', ]
+                passengerSelect$MotherSurvivedDiff <- mother$Survived * 2 - 1
+            } else {
+                passengerSelect$MotherSurvivedDiff <- 0 
+            }
+        } else {
+            passengerSelect$ParentsSurvivedDiff <- 0
+            passengerSelect$FatherSurvivedDiff <- 0
+            passengerSelect$MotherSurvivedDiff <- 0
+        }
+        
+        # insert selected passenger into passenger set
+        passenger[iPassenger, ] <- passengerSelect
+    }
+    
+    # survival of relatives
+    passenger$RelativesSurvivedDiff <- 
+        passenger$SpouseSurvivedDiff + 
+        passenger$SiblingSurvivedDiff + 
+        passenger$ChildrenSurvivedDiff + 
+        passenger$ParentsSurvivedDiff
+    
+    passenger
+}
+
+passenger <- updateSurvivalFeatures(passenger)
+    
+```
+
+This function is used to do k-fold validation by splitting the passenger data set into training, validation, and test sets. The test set consits of the same passengers as in the original data. 
+
+```{r}
+# function to split data into n sets of training and validation data
+nSplitData <- function(data, dataTest, n){
+    # number of observations
+    nData <- dim(data)[1]
+    dataSplit <- vector("list", n)
+    # number of samples per split
+    nSampleSplit <- round(nData / n)
+    
+    for (iSplit in 1:(n-1)){
+        iSelect <- vector(, nData)
+        # sample elements
+        indexSelect <- sample(nData, nSampleSplit)
+        iSelect[indexSelect] <- TRUE
+        
+        # move data into split set
+        dataSplit[[iSplit]] <- data[iSelect, ]
+        
+        # remove split set from data
+        data <- data[!iSelect, ]
+        nData <- nData - nSampleSplit
+    }
+    
+    # add remaining data to split set
+    dataSplit[[n]] <- data
+    
+    # combine splitted data to training and validation sets
+    training <- vector("list", n)
+    validation <- vector("list", n)
+    
+    for (iSet in 1:n){
+        indexSelect <- 1:n
+        indexSelect <- indexSelect[indexSelect != iSet]
+        training[[iSet]] <- dataSplit[[indexSelect[1]]]
+        validation[[iSet]] <- dataSplit[[iSet]]
+        for (iAdd in indexSelect[2:n]){
+            training[[iSet]] <- rbind(training[[iSet]], dataSplit[[iAdd]])
+        }
+        # relabel data set of validation data
+        validation[[iSet]]$DataSet <- as.factor("Validation")
+        
+        # order data sets by passenger id
+        training[[iSet]] <- training[[iSet]][order(training[[iSet]]$PassengerId), ]
+        validation[[iSet]] <- validation[[iSet]][order(validation[[iSet]]$PassengerId), ]
+    }
+    
+    # return training and validation data
+    list("training" = training, "validation" = validation, "test" = rep(list(dataTest[order(dataTest$PassengerId), ]), n))
+}
+```
+
+This function is used to update the survival feature in the validation and test sets with respect to the passengers' predicted survival. 
+
+```{r}
+updateSurvivalPerSet <- function(dataSet, prediction){
+
+    # number of sets
+    nSet <- length(dataSet$training)
+    
+    # check if validation data exists
+    valExists <- !is.null(dataSet$validation)
+    
+    for (iSet in 1:nSet){
+        # get training, validation, and test sets
+        training <- dataSet$training[[iSet]]
+        test <- dataSet$test[[iSet]]
+        if (valExists){
+            validation <- dataSet$validation[[iSet]]
+        } else{
+            validation <- NULL
+        }
+        
+        # add predicted survival to validation and training data set
+        test$Survived <- prediction$test[[iSet]]
+        
+        # combine data sets to passenger data set 
+        passengerSet <- rbind(training, validation, test)
+        # sort by passenger ID
+        passengerSet <- passengerSet[order(passengerSet$PassengerId), ]
+        
+        # update survival features
+        passengerSet <- updateSurvivalFeatures(passengerSet)
+        
+        # split data set again into training, validation, and test data sets
+        dataSet$training[[iSet]] <- passengerSet[passengerSet$DataSet == "Training", ]
+        dataSet$test[[iSet]] <- passengerSet[passengerSet$DataSet == "Test", ]
+        
+        # process validation data
+        if (valExists){
+            validation$Survived <- prediction$validation[[iSet]]
+            dataSet$validation[[iSet]] <- passengerSet[passengerSet$DataSet == "Validation", ]
+        }
+    }
+    
+    dataSet
+}
+```
+
+The following function is doing the one-hot encoding of features, which I apply to the features: Sex, Title, Deck, and CabinSide.
+
+```{r}
+hotEncodeFeature <- function(trainingData, validationData, testData){
+    # hot encode categorical features
+    # names of features to be encoded
+    featureEncode <- c("Sex", "Title", "Deck", "CabinSide")
+    
+    # check if validation data is given
+    valExists <- !is.null(validationData)
+    
+    
+    # number of sets
+    nSet <- length(trainingData)
+    for (iSet in 1:nSet){
+        
+        # get data sets
+        training <- trainingData[[iSet]]
+        test <- testData[[iSet]]
+        if (valExists){validation <- validationData[[iSet]]}
+    
+        for (feature in featureEncode){
+            # get values of feature
+            values <- as.character(unique(training[, feature]))
+            for (value in values){
+                # create feature name
+                newFeatureName <- paste0(feature, "_", value)
+                # populate feature for training, validation, and test data
+                training[, newFeatureName] <- training[, feature] == value
+                test[, newFeatureName] <- test[, feature] == value
+                if (valExists){validation[, newFeatureName] <- validation[, feature] == value}
+            }
+        }
+        # remove original feature from dataframe
+        training <- training[, !(names(training) %in% featureEncode)]
+        test <- test[, !(names(test) %in% featureEncode)]
+        if (valExists){validation <- validation[, !(names(validation) %in% featureEncode)]}
+        
+        # insert new sets
+        trainingData[[iSet]] <- training
+        testData[[iSet]] <- test
+        if (valExists){validationData[[iSet]] <- validation}
+    }
+    list('training' = trainingData, 'validation' = validationData, 'test' = testData)
+}
+
+```
+
+The next function normalises the data sets. Thereby, the parameters for normalisation are exclusively calculated for the training set while these parameters are also used to normalise the validation and test set. 
+
+```{r}
+# normalise data sets
+normaliseFeature <- function(trainingSet, validationSet, testSet){
+    # number of sets
+    nSet <- length(trainingSet)
+    
+    # check if validation data exists
+    valExists <- !is.null(validationSet)
+    
+    # names of features to be excluded from normalisation
+    featureExclude <- c("PassengerId", "Survived", "DataSet", "SpouseId", "SiblingId", "ChildrenId", "ParentsId", "SameTicketId")
+    
+    for (iSet in 1:nSet){
+        # get data sets
+        training <- trainingSet[[iSet]]
+        test <- testSet[[iSet]]
+        if (valExists){validation <- validationSet[[iSet]]}
+        
+        # get feature names to be normalised
+        featureNorm <- names(training)[!(names(training) %in% featureExclude)]
+        
+        for (feature in featureNorm){
+            # check if feature contains NAs
+            if (any(is.na(training[, feature]))){
+                # feature cannot be normalised
+                next
+            }
+            
+            # get maximum and minimum feature values
+            featureMax <- max(training[, feature])
+            featureMin <- min(training[, feature])
+            
+            # check if feauture need to be normed
+            if (featureMin == 0 & featureMax == 1){
+                # feature does not need to be normed
+                next
+            }
+            
+            # get range of feature
+            featureRange <- featureMax - featureMin
+            # check if range is 0
+            if (featureRange == 0){
+                # normalisation not possible - set all values to 0
+                training[, feature] <- 0
+                test[, feature] <- 0
+                if (valExists){validation[, feature] <- 0}
+                next
+            }
+            
+            # normalise feature
+            training[, feature] <- (training[, feature] - featureMin) / featureRange
+            test[, feature] <- (test[, feature] - featureMin) / featureRange
+            if (valExists){validation[, feature] <- (validation[, feature] - featureMin) / featureRange}
+        }
+        # insert new sets
+        trainingSet[[iSet]] <- training
+        testSet[[iSet]] <- test
+        if (valExists){validationSet[[iSet]] <- validation}
+    }
+    list('training' = trainingSet, 'validation' = validationSet, 'test' = testSet)
+}
+```
+
+# Prediction
+
+It is a bit tricky to include the survival information of relatives as features as obviously the survival of not all passengers is knwon. Therefore, I make one prediction without these features, use the predicted survival to update all features and then make the predictions with the survival features. Next, I compare the initial prediction with the new prediction and check if there were any changes. If so I repeat this process as long as there are no more changes between the previous and the last prediction.
+
+The following function is used to check if a prediction is equal to any prediction of a previous iteration.
+
+```{r}
+# function to check if prediction is equal to one element of set of predictions
+isPredictionEqual <- function(prediction, predictionSet){
+    
+    # number of prediction sets
+    nPred <- length(predictionSet)
+    # number of data sets
+    nSet <- length(prediction$test)
+    # check if validation data exists
+    valExists <- is.null(prediction$validation)
+    
+    # compare prediction
+    for (iPred in 1:nPred){
+        predictionComp <- predictionSet[[iPred]]
+        
+        predEqual <- TRUE
+        
+        # compare data set
+        for (iSet in 1:nSet){
+            if ((valExists && any(prediction$validation[[iSet]] != predictionComp$validation[[iSet]])) || 
+                any(prediction$test[[iSet]] != predictionComp$test[[iSet]])) {
+                predEqual <- FALSE
+                break
+            }
+        }
+        if (predEqual) {
+            return(TRUE)
+        }
+    }
+    FALSE
+}
+
+```
+
+The accuracy of the survival prediction is calculated via the following function:
+
+```{r}
+# calculate accuracy of prediction based on validation data
+predictionAccuracy <- function(prediction, survivalTrain, survivalVal){
+    
+    # number of data sets
+    nSet <- length(prediction$train)
+
+    accuracyTrain <- rep(NA, nSet)
+    for (iSet in 1:nSet){
+        accuracyTrain[iSet] <- mean(prediction$train[[iSet]] == survivalTrain[[iSet]])
+    }    
+
+    # check if validation data exists
+    if (!is.null(prediction$validation)){
+    
+        accuracyVal <- rep(NA, nSet)
+        
+        for (iSet in 1:nSet){
+            accuracyVal[iSet] <- mean(prediction$validation[[iSet]] == survivalVal[[iSet]])
+            
+        }
+    } else{
+        accuracyVal <- NULL
+    }
+    
+    list("train" = accuracyTrain, "val" = accuracyVal)
+}
+```
+
+To evaluate the predictor's accuarcy, I use cross-validation.
+
+## Logistic Regression
+
+I use logistic regression with regularisation to avoid overfitting. The parameter alpha can be set between 0 and 1 and combines L1 penalty (lasso regression) and L2 penalty (ridge regression) regularisation whereby a value of 0 means that pure L2 penalty is used while pure L1 penalty is used if alpha is set to 1. In order to keep things simple I only use values of 0 or 1. 
+The parameter lambda regulates the effect of the penalty on the loss function. The higher its value the stronger the effect of the penalty. Higher penalties force the optimisation to reduce the absolut value of the weights, which in turn reduces the variance of the model. 
+
+```{r}
+# function to fit logistic regression model
+fitModel <- function(X, y, p1, p2){
+    glmnet(X, y, family = "binomial", alpha = p1, lambda = p2, standardize = FALSE)
+}
+
+# function to use model to predict survival
+modelPredict <- function(model, X){
+    as.numeric(predict(model, X, type = "class"))
+}
+
+# this function predicts the survival without using any survival features
+predictionSurvival <- function(dataSet, alpha, lambda, initialPrediction = TRUE){
+    # number of sets
+    nSet <- length(dataSet$training)
+    # check if validation data exists
+    valExists <- !is.null(dataSet$validation)
+    
+    # initialise predicted variables
+    yTrainPred <- vector("list", nSet)
+    yValPred <- vector("list", nSet)
+    yTestPred <- vector("list", nSet)
+    
+    if (initialPrediction){
+        # features to be excluded from initial prediction
+        featureExclude <- c("PassengerId", 
+                            "Survived", 
+                            "DataSet", 
+                            "SpouseId", 
+                            "SpouseSurvivedDiff", 
+                            "SiblingId", 
+                            "SiblingSurvivedDiff", 
+                            "ChildrenId", 
+                            "ParentsId", 
+                            "ChildrenSurvivedDiff", 
+                            "ParentsSurvivedDiff", 
+                            "FatherSurvivedDiff", 
+                            "MotherSurvivedDiff", 
+                            "RelativesSurvivedDiff", 
+                            "SameTicketId", 
+                            "SameTicketSurvivedDiff")
+    } else {
+        # features to be excluded from prediction with survival information
+        featureExclude <- c("PassengerId", 
+                            "Survived", 
+                            "DataSet", 
+                            "SpouseId", 
+                            "SiblingId", 
+                            "ChildrenId", 
+                            "ParentsId", 
+                            "SameTicketId")            
+    }
+    
+    for (iSet in 1:nSet){
+        # get data sets
+        training <- dataSet$training[[iSet]]
+        test <- dataSet$test[[iSet]]
+        
+        # get target values
+        yTrain <- data.matrix(training$Survived)
+        # get all features for prediction
+        XTrain <- data.matrix(training[, !(names(training) %in% featureExclude)])
+        XTest <- data.matrix(test[, !(names(training) %in% featureExclude)])
+        
+        # predict survival with logistics regression with regularisation
+        model <- fitModel(XTrain, yTrain, alpha, lambda)
+        
+        # predict survival of test, validation and test set
+        yTrainPred[[iSet]] <- modelPredict(model, XTrain)
+        yTestPred[[iSet]] <- modelPredict(model, XTest)
+        
+        # process validation data set and predict if existing
+        if (valExists){
+            validation <- dataSet$validation[[iSet]]
+            yVal <- data.matrix(validation$Survived)
+            XVal <- data.matrix(validation[, !(names(training) %in% featureExclude)])            
+            yValPred[[iSet]] <- modelPredict(model, XVal)
+        } else{
+            yValPred <- NULL
+        }       
+    }
+    
+    list("train" = yTrainPred, "validation" = yValPred, "test" = yTestPred)
+}
+
+```
+
+The next function executes the whole pipeline from splitting the data set to one-hot encoding, normalising, predicting and updating of the survival features. This procedure is repeated as long as new predictions are different to all predictions of all previous iterations.
+
+```{r}
+# function to preprocess data set and run prediction
+
+predictSurvIt <- function (passenger, p1, p2, nFold = 5, iMax = 10){
+    # update survival features of passenger data set
+    passenger <- updateSurvivalFeatures(passenger)
+        
+    # split passenger data set into training and test set
+    trainingSet <- passenger[passenger$DataSet == "Training", ]
+    testSet <- passenger[passenger$DataSet == "Test", ]    
+    
+    # check if data shall be splitted
+    if (nFold > 0){
+        data <- nSplitData(trainingSet, testSet, nFold)
+ 
+       # copy survival information of validation data set to calculate accuracy of applied models later
+        survivedValOrg <- vector("list", nFold)
+        survivedTrain <- vector("list", nFold)
+        for (i in 1:nFold){
+            survivedValOrg[[i]] <- data$validation[[i]]$Survived
+            survivedTrain[[i]] <- data$train[[i]]$Survived
+        }  
+    } else{
+        data <- list("training" = list(trainingSet), "validation" = NULL, "test" = list(testSet))
+        survivedValOrg <- NULL
+        survivedTrain <- trainingSet$Survived
+    }
+    
+    # hot-encoding
+    encodeData <- hotEncodeFeature(data$training, data$validation, data$test)
+    # normalisatin
+    normData <- normaliseFeature(encodeData$training, encodeData$validation, encodeData$test)
+    # make initial predict without survival features
+    prediction <- predictionSurvival(normData, p1, p2, initialPrediction = TRUE)
+    initialPrediction <- prediction
+    
+    predictionAll <- vector("list", iMax + 1)
+    predictionAll[[1]] <- prediction
+    
+    # iteratively predict survival with survival features
+    for (i in 1:iMax){
+        # update survival features
+        data <- updateSurvivalPerSet(data, prediction)        
+        
+        # make new prediction
+        oldPrediction <- prediction
+        # hot-encoding
+        encodeData <- hotEncodeFeature(data$training, data$validation, data$test)
+        # normalisatin
+        normData <- normaliseFeature(encodeData$training, encodeData$validation, encodeData$test)
+        # predict with survival features
+        prediction <- predictionSurvival(normData, p1, p2, initialPrediction = FALSE)
+
+        # check if prediction changed
+        predictionAll[[i + 1]] <- prediction
+        if (isPredictionEqual(prediction, predictionAll[1:i])){
+            # last iteration did not change any prediction - algorithm has converged
+            break
+        }
+    }  
+    finalPrediction <- prediction
+    
+    # return inital, final prediction, and validation data
+    list("initial" = initialPrediction, "final" = finalPrediction, "survivalVal" = survivedValOrg, "survivalTrain" = survivedTrain)
+}
+```
+
+As an example I split the data into five folds and make a prediction for alpha = 0 and lambda = 0.05 and calculate the accuracy.
+
+```{r}
+# run prediction for alpha = 0 and lambda = 0.05
+set.seed(0)
+prediction <- predictSurvIt(passenger, p1 = 0, p2 = 0.05)
+
+accuracyInitial <- predictionAccuracy(prediction$initial, prediction$survivalTrain, prediction$survivalVal)
+accuracyFinal <- predictionAccuracy(prediction$final, prediction$survivalTrain, prediction$survivalVal)
+
+writeLines("Initial Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyInitial$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyInitial$val, 5)), collapse = ", ")))
+
+writeLines("Final Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyFinal$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyFinal$val, 5)), collapse = ", ")))
+
+```
+
+The initial prediction is the prediction which was made at the first iteration when the passengers' survival information was not available whereby the final prediction is the prediction of the last iteration where the passengers' survival information was extracted from the prediction of the previous iteration. Comparing these two results allows to quantify how much accuracy could be gain by including the passengers' survival information into the prediction. 
+The average accuracy of the initial prediction is 80.0% whereby the final prediction had an average accuracy of 81.5%. Thus, using the survival information improved the accuracy by 1.5% on average, which is quite significant taking into account that it takes a lot of effort to make such an imrovement with other methods. 
+It is interesting to see that there is a big variance in the difference of these two predictions. In case of the third data set, the accuracy of the final prediction was even slightly worse than the initial prediction whereby for the data sets one and four to accuracy could be improved by 2.2%.
+
+To optimise the hyper parameters, I vary the lambda parameter between 1e-1 and 1e-6 and finally choose the parameter with the highest cross-validation accuracy. I optimise lambda for alpha = 1 (pure L2 penalty) and alpha = 0 (pure L1 penalty).
+
+```{r}
+
+gridSearchP12 <- function(passenger, p1, p2){
+    
+    # number of parameter
+    nP1 <- length(p1)
+    nP2 <- length(p2)
+    nAll <- nP1 * nP2
+    
+    # combine parameter
+    result <- data.frame(p1 = rep(p1, nP2), p2 = rep(p2, each = nP1), accuracyTrain = rep(NA, nAll), accuracyVal = rep(NA, nAll))
+    
+    for (i in 1:nAll){
+        # reset seed to have the same sets for each lambda
+        set.seed(0)
+        prediction <- predictSurvIt(passenger, p1 = result$p1[i], p2 = result$p2[i])
+        # calculate average accuracy
+        accuracyAll <- predictionAccuracy(prediction$final, prediction$survivalTrain, prediction$survivalVal)
+        result$accuracyTrain[i] <- mean(accuracyAll$train)
+        result$accuracyVal[i] <- mean(accuracyAll$val)
+        print(paste("P1:", result$p1[i], 
+                    "P2:", result$p2[i], 
+                    "Accuracy Train:", result$accuracyTrain[i], 
+                    "Accuracy Val:", result$accuracyVal[i]))
+    }
+    
+    result
+}
+
+# lambda parameter for alpha = 0 and 1
+lambda0 <- c(1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 9e-6, 8e-6, 7e-6, 3e-6, 1e-6)
+lambda1 <- c(1e-1, 1e-2, 1e-3, 1e-4, 9e-5, 8e-5, 7e-5, 3e-5, 1e-5)
+
+# it takes almost 20 min to run these lines, thus I commented them out
+#print("alpha = 0:")
+#result0 <- gridSearchP12(passenger, 0, lambda0)
+#accuracyAlpha0 <- result0$accuracyVal
+#print("alpha = 1:")
+#result1 <- gridSearchP12(passenger, 1, lambda1)
+#accuracyAlpha1 <- result1$accuracyVal
+
+accuracyAlpha0 <- c(0.8113803, 0.8371916, 0.8372042, 0.8327098, 0.8383278, 0.8383278, 0.8349570, 0.8349570, 0.8372042, 0.8349570)
+accuracyAlpha1 <- c(0.6161697, 0.8304626, 0.8372105, 0.8394514, 0.8327098, 0.8338334, 0.8349570, 0.8349570, 0.8383278)
+```
+
+```{r, warning = FALSE}
+
+# create data frame with all parameters and their accuracy
+results <- data.frame(alpha = as.factor(c(rep(0, length(lambda0)), rep(1, length(lambda1)))), 
+                      lambda = c(lambda0, lambda1), 
+                      accuracy = c(accuracyAlpha0, accuracyAlpha1))
+
+ggplot(results, aes(x = lambda, y = accuracy, color = alpha)) + geom_line() + scale_x_log10() + ylim(c(0.75, 0.85))
+
+```
+
+The highest accuracy was found for alpha = 1 and lambda = 1e-4. Since the accuracies between alpha = 0 and 1 were very similar, I did not optimise the parameter alpha.
+
+Finally I train a model with the optimised parameters on the whole training data and make a prediction to be submitted.
+
+```{r}
+predictionTest <- predictSurvIt(passenger, p1 = 1, p2 = 1e-4, nFold = 0)
+survivalTest <- predictionTest$final$test[[1]]
+
+# create data frame for submission
+solutionLogReg <- data.frame(PassengerId = passenger$PassengerId[passenger$DataSet == "Test"], Survived = survivalTest)
+# submit prediction
+write.csv(solutionLogReg, "solutionLogReg.csv", row.names=FALSE)
+```
+
+The accuracy of this predictor on the test set is 0.80861 - seems like there is some overfitting on the validation set. 
+
+## K-Nearest Neighbour
+
+Next, I try a the K-Nearest Neighbur predictor. Therefore, I replace the logistics regressions predictor in the functions fitModel and modelPredict by the nearest neighbor classifier knn. As knn is making predictions directly without creating a model, the function fitModel is only used to broadcast all variables to modelPredict. 
+
+```{r}
+
+# function to fit knn
+fitModel <- function(X, y, p1, p2){
+    list("XTrain" = X, "yTrain" = y, "k" = p1)
+}
+
+# function to use model to predict survival
+modelPredict <- function(model, X){
+    as.numeric(knn(model$XTrain, X, model$yTrain, k = model$k)) - 1
+}
+
+```
+
+I make the first prediction with 5 neighbors:
+
+```{r}
+# make first prediction with 5 nearest neighbors
+set.seed(0)
+prediction <- predictSurvIt(passenger, p1 = 5, p2 = NULL)
+
+accuracyInitial <- predictionAccuracy(prediction$initial, prediction$survivalTrain, prediction$survivalVal)
+accuracyFinal <- predictionAccuracy(prediction$final, prediction$survivalTrain, prediction$survivalVal)
+
+writeLines("Initial Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyInitial$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyInitial$val, 5)), collapse = ", ")))
+
+writeLines("Final Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyFinal$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyFinal$val, 5)), collapse = ", ")))
+```
+
+The results are almost identical to logistic regression: the average accuracy over all validation sets of the initial prediction is 80.1% while the final prediction has an average accuracy of 81.6%. However, in contrast to logistic regression, there is only one validation set (set 4) for which the accuracy could be signifantly improve by 4.5% while the accuracy of sets 1, 3, and 5 almost remained the same. 
+Next I change the number of neighors parameter between 5 and 29 (only odd numbers are chosen as knn is making majority votes among the nearest neighbors and even numbers could lead to draws) to find out which value gives the highest accuracy.
+
+```{r}
+
+# to save calculation time this line is out commented
+# resultGrid <- gridSearchP12(passenger, c(5, 9, 15, 17, 19, 25, 29), NA)
+
+resultGrid <- data.frame(p1 = c(5, 9, 15, 17, 19, 25, 29), 
+                         p2 = rep(NA, 7), 
+                         accuracyVal = c(0.8159312, 0.8192957, 0.8271232, 0.8293641, 0.8237462, 0.8136275, 0.8102567))
+
+ggplot(resultGrid, aes(x = p1, y = accuracyVal)) + geom_line() + ylim(c(0.75, 0.85)) + xlab("Neighbors")
+
+```
+
+The highest accuracy on the validation data is 82.9% found for 17 neighbors which is 1% lower than the best result of the logistic regression. Thus, it is expectable that the accracy on the test data with knn will be lower as well. 
+
+```{r}
+predictionTest <- predictSurvIt(passenger, p1 = 17, p2 = NULL, nFold = 0)
+survivalTest <- predictionTest$final$test[[1]]
+
+# create data frame for submission
+solutionKnn <- data.frame(PassengerId = passenger$PassengerId[passenger$DataSet == "Test"], Survived = survivalTest)
+# submit prediction
+write.csv(solutionKnn, "solutionKnn.csv", row.names=FALSE)
+```
+
+The score on the test set is only 77.5%, thus I assume that KNN is clearly overfitting.
+
+## Naive Bayes
+
+Next, I try naive bayes classifier. An essential assumption of this classifier is that the input features are correlated with each other. This is not the case for the data set I'm using, e.g. sex of passengers is correlated with their title (i.a. Mr, Mrs, Ms, ...). Thus, I am not expecting that this classifier will be very accurate, but I want to give it a try. 
+
+The main idea of naive bayes is to multiply several probabilities whereby each probability is subject to only one feature to predict to probability of the output class. The problem here is that it can happen that one probability may be 0 so that the product of all probabilities is 0 as well. This can be problematic as other probabilities in this product could be very high and should be an idicator that there should be a significant overall probability for a specific class. To overcome this problem, there is a smoothing parameter k, called laplace smoothing which can avoid that any probability of the product is 0 and therewith ensure that the overall probability is greater than 0 in any case. The higher the value of k the more similar probabilities can become, while a value of 0 disables smoothing completely. I will test a few different values of k to find out which one promises the highest accuracy. 
+
+First, I need to update the training and prediction functions to use naive bayes. To apply the laplace parameter I have to convert all categorical features to factors
+
+```{r}
+
+# this function converts the input arrays to data frames while categorical features are represented by factor variables 
+# this is certainly slows down the model signigifantly but I did not want to make changes on the pervious functions
+matrixToDf <- function(X, y = NULL){
+    # number of columns
+    nCol <- ncol(X)
+    df <- data.frame(X)
+    
+    # check if column shall be converted to factor
+    for (i in 1:nCol){
+        if (all(unique(df[, i]) %in% c(0, 1))){
+            df[, i] <- as.factor(df[, i])
+        }
+        
+    }
+    
+    # check if survival shall be added
+    if (!is.null(y)){
+        df$y <- as.factor(y)
+    }
+    
+    df
+}
+
+# function to fit Naive Bayes
+fitModel <- function(X, y, p1, p2){
+    # convert input data to data frame
+    df <- matrixToDf(X, y)
+    
+    # create model
+    naiveBayes(y ~ ., data = df, laplace = p1)
+}
+
+# function to use model to predict survival
+modelPredict <- function(model, X){
+    # convert input data to data frame
+    df <- matrixToDf(X)
+    
+    as.numeric(predict(model, df)) - 1
+}
+
+```
+
+Now I make the first prediction by setting k to 1:
+
+```{r}
+
+# make first prediction with naive bayes
+set.seed(0)
+prediction <- predictSurvIt(passenger, p1 = 1, p2 = NULL)
+
+accuracyInitial <- predictionAccuracy(prediction$initial, prediction$survivalTrain, prediction$survivalVal)
+accuracyFinal <- predictionAccuracy(prediction$final, prediction$survivalTrain, prediction$survivalVal)
+
+
+writeLines("Initial Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyInitial$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyInitial$val, 5)), collapse = ", ")))
+writeLines("Final Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyFinal$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyFinal$val, 5)), collapse = ", ")))
+
+```
+
+The average accuracy of the final prediction on the validation set is 77.6%. This is clearly worse than logistic regression and KNN which should be mainly due to the fact that the used features are correlated. Another problem of naive bayes could be that all features have the same impact on the output. As this data set contains a lot of features with different importance, this could be another reason for the poor performance of naive bayes. There is almost no difference in the accuracy between the initial and the final prediction.  
+
+To make sure that this result is not caused due to a bad choice of the laplace parameter, I do a grid search with different values. 
+
+```{r, warning = FALSE}
+# to save time I outcommented this line
+# resultGrid <- gridSearchP12(passenger, c(0, 0.1, 1, 10, 100), NA)
+
+# these are the results of the calculation
+resultGrid <- data.frame(p1 = c(0, 0.1, 1, 10, 100), 
+                         p2 = rep(NA, 5), 
+                         accuracyVal = c(0.776630468897119, 0.776630468897119, 0.775506873391501, 0.772142363944511, 0.765400790910803))
+
+ggplot(resultGrid, aes(x = p1, y = accuracyVal)) + geom_line() + xlab("Laplace Smoothing Parameter") + scale_x_log10() + ylim(c(0.75, 0.85))
+
+```
+
+Interestingly, the highest accuracy is reached with a smooting parameter of 0 which means that no smoothing should be done at all. Although I tried a wide range of smoothing parameters, the accuracy still remains significantly lower than that of the other classifiers I have tried yet. 
+
+To complete this section I make a prediction on the test set to get the test score of the naive bayes classifier.
+
+```{r}
+predictionTest <- predictSurvIt(passenger, p1 = 0, p2 = NULL, nFold = 0)
+survivalTest <- predictionTest$final$test[[1]]
+
+# create data frame for submission
+solutionNB <- data.frame(PassengerId = passenger$PassengerId[passenger$DataSet == "Test"], Survived = survivalTest)
+# submit prediction
+write.csv(solutionNB, "solutionNB.csv", row.names=FALSE)
+```
+
+As expected the accuracy on the test set with this classifier was really low with only 74.6%. 
+
+## Decision Tree
+
+Next, I try decision tree. Decision trees can handle categorical and continius features very well and in contrast to KNN and naive bayes are also able to identify which features are important and weight these accordingly. Thus, I am expecting that decision trees will be better than KNN and naive bayes. The downside of decision trees is that they are prone to overfitting. Thus, I am sure that random forest will outperform decision trees. 
+
+There are many parameters which can be tuned to reduce the danger overfitting. In this kernel I will only consider the minimum number of observations in order to further split a node (minsplit) and the maximum depth of the tree (maxdepth).
+
+Again I update the fit and predict functions to use decision trees:
+
+```{r}
+
+# function to fit decision tree
+fitModel <- function(X, y, p1, p2){
+    # convert matrix data data frame
+    df <- data.frame(X)
+    df$y <- y
+    
+    # set hyper-parameter
+    control <- rpart.control(minsplit = p1, maxdepth = p2, cp = 0, maxcompete = 1, maxsurrogate = 1, xval = 1)
+    # create model
+    rpart(y ~., data = df, method = "class", control = control)
+}
+
+# function to use model to predict survival
+modelPredict <- function(model, X){
+    # convert matrix data data frame
+    df <- data.frame(X)
+    
+    as.numeric(predict(model, df, type = "class")) - 1
+}
+
+```
+
+Now I make my first prediction with a simple model with a depth of 5 having at least 10 observations in each node to make a further split. 
+
+```{r}
+
+# make first prediction with decision trees. 
+set.seed(0)
+prediction <- predictSurvIt(passenger, p1 = 10, p2 = 5)
+
+accuracyInitial <- predictionAccuracy(prediction$initial, prediction$survivalTrain, prediction$survivalVal)
+accuracyFinal <- predictionAccuracy(prediction$final, prediction$survivalTrain, prediction$survivalVal)
+
+writeLines("Initial Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyInitial$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyInitial$val, 5)), collapse = ", ")))
+writeLines("Final Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyFinal$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyFinal$val, 5)), collapse = ", ")))
+
+```
+
+The average accuracy on the validation set is 83.8%, which looks quite promising. There is almost no difference in the accuracy between the initial and the final prediction which could be due to the low depth of the trees. Most likely not many splits were made based on the relatives' survival information so that these features did not have a big impact. Neverthless, I am sure when the depth of the trees gets increased the difference between initial and final prediction will increase. 
+
+Now I do a grid search on minsplit and maxdepth to find the best hyper-parameter combination.
+
+```{r, warning = FALSE}
+minsplit <- c(10, 20, 30, 40, 50, 60)
+maxdepth <- c(4, 6, 8, 10)
+
+# to save time I outcommented this line
+# resultGrid <- gridSearchP12(passenger, minsplit, maxdepth)
+resultGrid <- data.frame(p1 = rep(minsplit, length(maxdepth)), 
+                         p2 = rep(maxdepth, each = length(minsplit)), 
+                         accuracyVal = c(0.830506559538008, 0.832728642269788, 0.832734919339652, 0.831611323834034, 0.815899817964974, 0.821517795493064, 
+                                      0.828278199736363, 0.842847278890214, 0.833883623124725, 0.836124537066098, 0.805812566693867, 0.810306948716339, 
+                                      0.82712949595129,  0.838352896867742, 0.832760027619107, 0.840600087878978, 0.806936162199485, 0.810306948716339, 
+                                      0.817010859330864, 0.839470215303496, 0.832760027619107, 0.840600087878978, 0.806936162199485, 0.810306948716339))
+
+ggplot(resultGrid, aes(x = p1, y = accuracyVal, color = as.factor(p2))) + 
+    geom_line() + 
+    ylim(c(0.75, 0.85)) + 
+    xlab("Min Split") + 
+    labs(color = "Max Depth")
+
+```
+
+The graph shows that trees with a maximum depth between 6 and 10 and minimum split between 20 and 40 performed best. The highest accuracy was 84.3% with maximum depth of 6 and minimum split of 20. Trees with a maximum depth of 4 are obviously underfitting. The accuracy of trees with a higher depth converge to the same value for the highest number of minimum splits as these trees do not reach their maximum depth before nodes are not allowed to be split further due to the high number of minsplit - it is expectable that all these trees are identical. 
+
+Finally, I make a prediction with the best parameters to predict survival on the test set. 
+
+```{r}
+predictionTest <- predictSurvIt(passenger, p1 = 20, p2 = 6, nFold = 0)
+survivalTest <- predictionTest$final$test[[1]]
+
+# create data frame for submission
+solutionDecisionTree <- data.frame(PassengerId = passenger$PassengerId[passenger$DataSet == "Test"], Survived = survivalTest)
+# submit prediction
+write.csv(solutionDecisionTree, "solutionDecisionTree.csv", row.names = FALSE)
+```
+
+The score on the test set with this prediction is 79.4%. Thus, there is a massive decrease in accuracy of almost 5%. I think the reason for that is that I treid many different parameter values a therewith substantially overfitted on the validation data set. 
+
+Another option to tune the parameters of decision tree is to use the complexity parameter cp. This parameter defines the by how much the objective function must be improved after splitting a node. If this is not achieved the respective node will not be split and other nodes are checked. Once no node is left to be split the algorithm is finished. I redefine the fit function to use this parameter. In order to use this parameter only I set minsplit to 2 and maxdepth to 30 so that these parameter have no effect anymore. 
+
+```{r}
+# function to fit decision tree
+fitModel <- function(X, y, p1, p2){
+    # convert matrix data data frame
+    df <- data.frame(X)
+    df$y <- y
+    
+    # set hyper-parameter
+    control <- rpart.control(minsplit = 2, maxdepth = 30, cp = p1, maxcompete = 1, maxsurrogate = 1, xval = 1)
+    # create model
+    rpart(y ~., data = df, method = "class", control = control)
+}
+
+```
+
+Let's make a prediction with the default value of cp which is 0.01.
+
+```{r}
+
+# make first prediction with decision trees
+set.seed(0)
+prediction <- predictSurvIt(passenger, p1 = 0.01, p2 = NA)
+
+accuracyInitial <- predictionAccuracy(prediction$initial, prediction$survivalTrain, prediction$survivalVal)
+accuracyFinal <- predictionAccuracy(prediction$final, prediction$survivalTrain, prediction$survivalVal)
+
+writeLines("Initial Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyInitial$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyInitial$val, 5)), collapse = ", ")))
+writeLines("Final Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyFinal$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyFinal$val, 5)), collapse = ", ")))
+
+```
+
+The average accuracy on the validation sets is 83.7%, which is 0.1% worse than by using minsplit and maxdepth. I will do another grid search with only this parameter to see if there is a way to make better predictions than with the previous parameters. 
+
+```{r, warning = FALSE}
+cp <- c(0, 0.001, 0.003, 0.005, 0.007, 0.009, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1)
+
+# to save time I outcommented this line
+#resultGrid <- gridSearchP12(passenger, cp, NA)
+resultGrid <- data.frame(p1 = cp, 
+                         p2 = rep(NA, length(cp)), 
+                         accuracyVal = c(0.809133136651811, 0.814751114179901, 0.836093151716779, 0.83611198292637, 0.832741196409516, 0.834982110350888, 
+                                      0.837216747222397, 0.825980792166217, 0.825980792166217, 0.825980792166217, 0.821486410143745, 0.821486410143745))
+
+ggplot(resultGrid, aes(x = p1, y = accuracyVal)) + geom_line() + xlab("Complexity Parameter") + scale_x_log10() + ylim(c(0.75, 0.85))
+
+```
+
+It turned out that 0.01 is actually the best parameter value. Thus, I higher accuracy on the validation sets than 83.7% seems not to be possible. When cp is smaller, the too many nodes are split so that the model is overfitting while higher values lead to uderfitting. There are some plateaus at the right side of the graph where the accuracy did not change while increasing cp. This can be explained that in this area the change of cp is so small that exactly the same trees are created. 
+As this is worse than the validation error with minsplit and maxdepth I am not making a submission with this model.
+
+## Support Vector Machines
+
+Next I try Support Vector Machines (SVM). This classifier is certainly more complex than all the others which I tried so far, so let's see if it is possible to improve accuracy. 
+
+There are quite a lot of parameters which can be tuned. For this notebook I focus on the radial kernel and the parameters C and gamma. The kernel is actually a function which is used to calculate the similarity of two training examples with respect to their distance. Gamma is a parameter within the kernel which can be used for scaling. The higher gamma is, the more similar training examples are considered which are far away from each other. The parameter C is a meassure how strong misclassifications are penalised. A low value of C causes a lower penalty so that the decision surface becomes smoother.
+
+Again, I update the fit and predict functions to use SVM and tune the parameters later.
+
+```{r}
+# function to fit SVM
+fitModel <- function(X, y, p1, p2){
+    # create model
+    svm(X, as.factor(y), scale = FALSE, kernel = "radial", gamma = p1, cost = p2)
+}
+
+# function to use model to predict survival
+modelPredict <- function(model, X){
+    as.numeric(predict(model, X)) - 1
+}
+```
+
+First, I make a prediction where gamma and C are set to 1 (default values).
+
+```{r}
+# make first prediction with SVM
+set.seed(0)
+prediction <- predictSurvIt(passenger, p1 = 1, p2 = 1)
+
+accuracyInitial <- predictionAccuracy(prediction$initial, prediction$survivalTrain, prediction$survivalVal)
+accuracyFinal <- predictionAccuracy(prediction$final, prediction$survivalTrain, prediction$survivalVal)
+
+writeLines("Initial Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyInitial$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyInitial$val, 5)), collapse = ", ")))
+writeLines("Final Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyFinal$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyFinal$val, 5)), collapse = ", ")))
+
+```
+
+The average final accuracy on the validation set is 80.9%. There was an improvement of 1.1% compared to the inital prediction. The training accuracy is with 88.5% very high. Thus, I am sure that the model is overfitting with these parameters and it should be possible to improve the validation accuracy by tuning the hyperparameter.
+
+```{r, warning = FALSE}
+gamma <- c(0.0003, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3)
+C <- c(0.3, 1, 3, 10, 30, 100, 300)
+
+# to save time I outcommented this line
+#resultGrid <- gridSearchP12(passenger, gamma, C)
+resultGrid <- data.frame(p1 = rep(gamma, length(C)), 
+                         p2 = rep(C, each = length(gamma)), 
+                         accuracyVal = c(0.616169731969117, 0.616169731969117, 0.686836984495637, 0.786705166028498, 0.797916012805223, 0.828221706107589, 0.832716088130061,
+                                      0.616169731969117, 0.726150273052539, 0.786705166028498, 0.797916012805223, 0.829345301613207, 0.842828447680623, 0.833833406565815, 
+                                      0.691318812378382, 0.786705166028498, 0.793427907852614, 0.832716088130061, 0.842828447680623, 0.840574979599523, 0.836080597577051, 
+                                      0.786705166028498, 0.794551503358232, 0.832716088130061, 0.843952043186241, 0.843952043186241, 0.834950725001569, 0.822628836858954,
+                                      0.793427907852614, 0.832716088130061, 0.841704852175005, 0.843952043186241, 0.842822170610759, 0.827116941811562, 0.824869750800326, 
+                                      0.832716088130061, 0.843952043186241, 0.843952043186241, 0.843952043186241, 0.832703533990333, 0.827135773021154, 0.818128177766619, 
+                                      0.841704852175005, 0.843952043186241, 0.845075638691859, 0.840568702529659, 0.830481451258553, 0.825993346305944, 0.817017136400728)) 
+
+ggplot(resultGrid, aes(x = p1, y = accuracyVal, color = as.factor(p2))) + 
+    geom_line() + 
+    ylim(c(0.75, 0.85)) + 
+    xlab("Gamma") + 
+    labs(color = "C") +
+    scale_x_log10()
+
+```
+
+Almost each parameter set reaches an accuracy of 84%, however, lower the value of C the higher gamma must be to reach the maximum. This is because, the higher each parameter value the more likely the model is underfitting. Thus, when C is increased, gamma needs to be decreased to reach the optimum. Another interesting obsevation is that with an increase of C the accuracy curve becomes flatter - a longer range of gamma parameters leads to almost the same accuracy. Therefore, it makes more sense to choose a high value of C, since then the sensitivity of the model on gamma is reduced and therewith the danger of overfitting or underfitting. For the submission prediction I set gamma to 0.003 and C to 300.
+
+```{r}
+predictionTest <- predictSurvIt(passenger, p1 = 0.003, p2 = 300, nFold = 0)
+survivalTest <- predictionTest$final$test[[1]]
+
+# create data frame for submission
+solutionSVM <- data.frame(PassengerId = passenger$PassengerId[passenger$DataSet == "Test"], Survived = survivalTest)
+# submit prediction
+write.csv(solutionSVM, "solutionSVM.csv", row.names = FALSE)
+```
+
+The score on the test set is 79.4% which is exactly the same as with decision trees. Due to the big difference to the validation accuracy it looks like SVC is overfitting as well. 
+
+
+## Random Forest
+
+The next classifier I try is random forest. There are a lot of different hyperparameters which can be tuned. I will focus on ntree - total number of trees, mtry - number of randomly sampled variables for each split, and maxnodes - maximum number of nodes a tree can have. 
+
+First of all I need to update the fit and predict functions:
+
+```{r}
+
+# function to fit Random Forest
+fitModel <- function(X, y, p1, p2){
+    # create model
+    randomForest(X, as.factor(y), ntree = p1, mtry = 10, maxnodes = p2)
+}
+
+# function to use model to predict survival
+modelPredict <- function(model, X){
+    as.numeric(predict(model, X)) - 1
+}
+
+```
+
+For the first run I set the number of trees to 50 and limit the maximum number of nodes to 12.
+
+```{r}
+
+# make first prediction with Random Forest
+set.seed(0)
+prediction <- predictSurvIt(passenger, p1 = 50, p2 = 12)
+
+accuracyInitial <- predictionAccuracy(prediction$initial, prediction$survivalTrain, prediction$survivalVal)
+accuracyFinal <- predictionAccuracy(prediction$final, prediction$survivalTrain, prediction$survivalVal)
+
+writeLines("Initial Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyInitial$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyInitial$val, 5)), collapse = ", ")))
+writeLines("Final Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyFinal$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyFinal$val, 5)), collapse = ", ")))
+
+```
+
+The prediction is quite good with an accuracy of 83.7% on the validation set, which improved by 0.6% compared the initial prediction. The accuracy on the training set is 84.9% so it seems that there is not much of an overfit. 
+
+Before I tune mtry and maxnodes I start with ntree. I expect there is no optimum number of trees - the higher this number the better the accuracy. However, the accuracy will saturate so that at some having more trees will unnecessarily increase compution time. 
+
+```{r}
+nTree <- c(1, 3, 10, 30, 100, 300)
+
+# to save time I outcommented this line
+#resultGrid <- gridSearchP12(passenger, nTree, 12)
+resultGrid <- data.frame(p1 = nTree, 
+                         p2 = rep(12, length(nTree)), 
+                         accuracy = c(0.801274245182349, 0.834963279141297, 0.839482769443224, 0.839463938233633, 0.837210470152533, 0.839457661163769))
+
+ggplot(resultGrid, aes(x = p1, y = accuracy)) + geom_line() + xlab("Number of trees") + scale_x_log10() + ylim(c(0.75, 0.85))
+
+```
+
+It looks that 30 trees are more than enough, so I will use this number of a further predictions. Next, I optimise mtry and maxnodes. 
+
+```{r}
+
+# update function to fit Random Forest
+fitModel <- function(X, y, p1, p2){
+    # create model
+    randomForest(X, as.factor(y), ntree = 30, mtry = p1, maxnodes = p2)
+}
+
+mtry <- c(5, 10, 20, 34)
+maxnodes <- c(8, 16, 32, 64, 128, 256)
+
+#resultGrid <- gridSearchP12(passenger, mtry, maxnodes)
+resultGrid <- data.frame(p1 = rep(mtry, length(maxnodes)), 
+                         p2 = rep(maxnodes, each = length(mtry)), 
+                         accuracyVal = c(0.819239219132509, 0.832722365199925, 0.834963279141297, 0.834963279141297, 
+                                      0.832716088130061, 0.841692298035277, 0.839445107024041, 0.834963279141297, 
+                                      0.836093151716779, 0.836093151716779, 0.846174125918021, 0.847322829703095, 
+                                      0.840574979599523, 0.846199234197477, 0.840581256669387, 0.846192957127613, 
+                                      0.833845960705543, 0.841698575105141, 0.843939489046513, 0.836099428786642, 
+                                      0.833845960705543, 0.840562425459795, 0.837216747222397, 0.836099428786642))
+
+ggplot(resultGrid, aes(x = p2, y = accuracyVal, color = as.factor(p1))) + 
+    geom_line() + 
+    ylim(c(0.75, 0.85)) + 
+    xlab("maxnodes") + 
+    labs(color = "mtry") +
+    scale_x_log10()
+
+```
+
+The maximum number of nodes does not seem to have a big effect on the accuracy, values between 16 and 256 reach similar accuracies. Regarding mtry, the graph shows that 5 performs worse than higher numbers, while the others are fluctuating so that there is no number which is clearly the best. The parameter set which reached the highest accuracy of 84.7% was with mtry = 34 and maxnodes = 32. I will use these parameters for the prediction on the test set.
+
+Since the optimised parameters are quite far away from the parameters I used to decide how many trees are needed, I run the grid search regarding the number of trees again. Therefore, I use the model with the highest complexity - mtry = 34 and maxnodes = 256.
+
+```{r}
+
+# update function to fit Random Forest
+fitModel <- function(X, y, p1, p2){
+    # create model
+    randomForest(X, as.factor(y), ntree = p1, mtry = 34, maxnodes = p2)
+}
+
+nTree <- c(1, 3, 10, 30, 100, 300, 1000)
+
+# to save time I outcommented this line
+#resultGrid <- gridSearchP12(passenger, nTree, 256)
+#resultGrid <- data.frame(p1 = nTree, 
+#                         p2 = rep(50, length(nTree)), 
+#                         accuracyVal = c(0.768752746218065, 0.799027054171113, 0.832709811060197, 0.836099428786642, 0.827110664741699, 0.834957002071433, 0.834963279141297))
+
+ggplot(resultGrid, aes(x = p1, y = accuracyVal)) + geom_line() + xlab("Number of trees") + scale_x_log10() + ylim(c(0.75, 0.85))
+
+```
+
+Again, there is no further increase one the number of trees reached 30, so I will keep this number.
+
+Now I make a prediction for the test set. 
+
+```{r}
+
+# update function to fit Random Forest
+fitModel <- function(X, y, p1, p2){
+    # create model
+    randomForest(X, as.factor(y), ntree = 30, mtry = p1, maxnodes = p2)
+}
+
+predictionTest <- predictSurvIt(passenger, p1 = 34, p2 = 32, nFold = 0)
+survivalTest <- predictionTest$final$test[[1]]
+
+# create data frame for submission
+solutionRandomForest <- data.frame(PassengerId = passenger$PassengerId[passenger$DataSet == "Test"], Survived = survivalTest)
+# submit prediction
+write.csv(solutionRandomForest, "solutionRandomForest.csv", row.names = FALSE)
+
+# public score: 0.76555
+```
+
+The public score is only 76.6% which is again much lower than validation accuracy of 84.7%. It is diffcult to say what causes these differences. Maybe the used models are too complex and the number of used features is too high.
+
+Let's have a look at the training and validation error of this prediction:
+
+```{r}
+
+# make first prediction with Random Forest
+set.seed(0)
+prediction <- predictSurvIt(passenger, p1 = 34, p2 = 32)
+
+accuracyInitial <- predictionAccuracy(prediction$initial, prediction$survivalTrain, prediction$survivalVal)
+accuracyFinal <- predictionAccuracy(prediction$final, prediction$survivalTrain, prediction$survivalVal)
+
+writeLines("Initial Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyInitial$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyInitial$val, 5)), collapse = ", ")))
+writeLines("Final Prediction Accuracy:")
+writeLines(paste("Training:", paste(as.character(round(accuracyFinal$train, 5)), collapse = ", ")))
+writeLines(paste("Validation:", paste(as.character(round(accuracyFinal$val, 5)), collapse = ", ")))
+
+```
+
+Here we can see that the model is massively overfitting: The accuracy on the test set is 91.2% and falls by 6.4% for the validation set. There is another drop of 8.1% between the validation and the test set. Thus, it is not the best criteria to choose the model which achieves the highest cross validation score. The difference between the training and validation accuracy must be taken into account as well. 
+
+First of all, lets have a look how the training accuracy changes with the number of trees.
+
+```{r}
+
+# update function to fit Random Forest
+fitModel <- function(X, y, p1, p2){
+    # create model
+    randomForest(X, as.factor(y), ntree = p1, mtry = 34, maxnodes = p2)
+}
+
+nTree <- c(1, 3, 10, 30, 100, 300, 1000)
+
+# to save time I outcommented this line
+#resultGrid <- gridSearchP12(passenger, nTree, 256)
+resultGrid <- data.frame(p1 = nTree, 
+                         p2 = rep(50, length(nTree)), 
+                         accuracyTrain = c(0.912173991836992, 0.95651188994122, 0.979518414044156, 0.991020691176702, 0.995791638432324, 0.995791638432324, 0.995791638432324),
+                         accuracyVal = c(0.768752746218065, 0.799027054171113, 0.832709811060197, 0.836099428786642, 0.827110664741699, 0.834957002071433, 0.834963279141297))
+
+```
+
+```{r}
+
+ggplot(resultGrid, aes(x = p1)) + 
+    geom_line(aes(y = accuracyTrain, colour = "Train")) + 
+    geom_line(aes(y = accuracyVal, colour = "Val")) + 
+    xlab("Number of trees") + 
+    scale_x_log10() + 
+    ylim(c(0.75, 1))
+
+```
+
+One very simple way could be to subtract the difference between training and validation accuracy from the validation accuracy or to define a maximum threshold for the difference between training and validation accuracy which must not be exceeded. 
+I will try this in the next step.
+
+
+
+
+
+

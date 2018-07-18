@@ -1,0 +1,1067 @@
+---
+title: "How to handle correlated Features?"
+author: "Reinhard Sellmair"
+date: "25 June 2018"
+output:
+  html_document:
+    number_sections: yes
+    toc: yes
+    code_folding: hide
+  pdf_document:
+    toc: yes
+---
+
+# Introduction
+
+In my [Imputation and Feature Engineering kernel](https://www.kaggle.com/reisel/imputation-and-feature-engineering) I extracted more than 50 features after one-hot encoding. The produced data set contains a lot of strongly correlated features. In this kernel I analyse these correlation. Furthermore, I implement different strategies to reduce the number of features and test these strategies with respect to the achievable prediction accuracy of different classifiers.
+
+First, I will start with an overview of the data set I use. Next, I analyse the correlation of these features. Thereafter, I will develop and run some strategies to reduce the number of correlated features. In the last part I train Support Vector Machines and Random Forest on the created data set and test their accuracies. 
+
+```{r, message=FALSE, warning = FALSE}
+# load packages
+library(dplyr)
+library(knitr)
+library(kableExtra)
+library(ggplot2)
+library(corrplot)
+library(glmnet)
+library(e1071)
+library(randomForest)
+```
+
+# Data Preparation
+
+The data set I use also contains information about the survival of passengers' relatives. In the [Save the Families! kernel]( https://www.kaggle.com/reisel/save-the-families) I described how I derived these relations. 
+
+```{r}
+
+# load data
+passenger <- read.csv("../input/imputation-and-feature-engineering/passenger.csv")
+
+# change data types
+passenger$Name <- as.character(passenger$Name)
+passenger$Ticket <- as.character(passenger$Ticket)
+passenger$Cabin <- as.character(passenger$Cabin)
+passenger$Surname <- as.character(passenger$Surname)
+passenger$MaidenName <- as.character(passenger$MaidenName)
+passenger$Firstname <- as.character(passenger$Firstname)
+passenger$SiblingId <- as.character(passenger$SiblingId)
+passenger$ChildrenId <- as.character(passenger$ChildrenId)
+passenger$ParentsId <- as.character(passenger$ParentsId)
+passenger$HusbandFirstname <- as.character(passenger$HusbandFirstname)
+passenger$SiblingId <- as.list(passenger$SiblingId)
+passenger$ChildrenId <- as.list(passenger$ChildrenId)
+passenger$ParentsId <- as.list(passenger$ParentsId)
+passenger$SameTicketId <- as.list(passenger$SameTicketId)
+
+# remove "X" column
+passenger <- select(passenger, -X)
+
+# convert passenger ids of relatives from character to lists of integers
+for (i in 1:dim(passenger)[1]){
+    passengerSelect <- passenger[i, ]
+    
+    # convert sibling ids
+    if (!is.na(passengerSelect$SiblingId)){
+        passengerSelect$SiblingId <- list(as.numeric(unlist(strsplit(passengerSelect$SiblingId[[1]], ";"))))
+    } else {
+        passengerSelect$SiblingId <- NA
+    }
+    # convert children ids
+    if (!is.na(passengerSelect$ChildrenId)){
+        passengerSelect$ChildrenId <- list(as.numeric(unlist(strsplit(passengerSelect$ChildrenId[[1]], ";"))))
+    } else {
+        passengerSelect$ChildrenId <- NA
+    }
+    # convert parents ids
+    if (!is.na(passengerSelect$ParentsId)){
+        passengerSelect$ParentsId <- list(as.numeric(unlist(strsplit(passengerSelect$ParentsId[[1]], ";"))))
+    } else {
+        passengerSelect$ParentsId <- NA
+    } 
+    # convert same ticket id
+    if (!is.na(passengerSelect$SameTicketId)){
+        passengerSelect$SameTicketId <- list(as.numeric(unlist(strsplit(as.character(passengerSelect$SameTicketId[[1]]), ";"))))
+    } else {
+        passengerSelect$SameTicketId <- NA
+    } 
+    
+    passenger[i, ] <- passengerSelect
+}
+
+# add feature about survival of passengers with same ticket
+passenger$SameTicketSurvivedDiff <- NA
+
+```
+
+One problem with the survival iformation of related passengers is of course that this information is not known for everyone. Therefore, I use the prediction of my another [kernel](https://www.kaggle.com/reisel/iterative-prediction-of-survival) to complete these features. 
+
+```{r}
+
+# import prediction
+prediction <- read.csv("../input/iterative-prediction-of-survival/solutionLogReg.csv")
+
+# number of prediction
+nPred <- nrow(prediction)
+
+# insert predicted survival to data set
+for (i in 1:nPred){
+    passenger$Survived[passenger$PassengerId == prediction$PassengerId[i]] <- prediction$Survived[i]
+}
+
+# next, I update the survival inforamtion of all relatives
+# function to update survival features of all passengers
+updateSurvivalFeatures <- function(passenger){
+    # number of passengers
+    nPassenger <- dim(passenger)[1]
+    # transform survived feature to -1 or 1
+    survived <- passenger$Survived * 2 - 1
+    # set survival differences to NA
+    passenger$SameTicketSurvivedDiff <- NA
+    passenger$SpouseSurvivedDiff <- NA
+    passenger$SiblingSurvivedDiff <- NA
+    passenger$ChildrenSurvivedDiff <- NA
+    passenger$ParentsSurvivedDiff <- NA
+    passenger$FatherSurvivedDiff <- NA
+    passenger$MotherSurvivedDiff <- NA
+
+    for (iPassenger in 1:nPassenger){
+        passengerSelect <- passenger[iPassenger, ]
+        
+        # survival of spouse
+        if (passengerSelect$SpouseNumber == 1){
+            passengerSelect$SpouseSurvivedDiff <- survived[passengerSelect$SpouseId]
+        } else {
+            passengerSelect$SpouseSurvivedDiff <- 0
+        }
+        
+        # survival of siblings
+        passengerSelect$SiblingSurvivedDiff <- 
+            sum(survived[passenger$PassengerId %in% unlist(passengerSelect$SiblingId)])
+        
+        # survival of children
+        passengerSelect$ChildrenSurvivedDiff <- 
+            sum(survived[passenger$PassengerId %in% unlist(passengerSelect$ChildrenId)])    
+        
+        # survival of parents
+        passengerSelect$ParentsSurvivedDiff <- 
+            sum(survived[passenger$PassengerId %in% unlist(passengerSelect$ParentsId)])    
+
+        # survival of passengers with same ticket
+        passengerSelect$SameTicketSurvivedDiff <- 
+            sum(survived[passenger$PassengerId %in% unlist(passengerSelect$SameTicketId)])        
+        
+        # survival of mother and father
+        if (passengerSelect$ParentsNumber > 0){
+            # get parents
+            parents <- passenger[passenger$PassengerId %in% unlist(passengerSelect$ParentsId), ]
+            # survival of father
+            if (passengerSelect$FatherNumber == 1){
+                father <- parents[parents$Sex == 'male', ]
+                passengerSelect$FatherSurvivedDiff <- father$Survived * 2 - 1
+            } else {
+                passengerSelect$FatherSurvivedDiff <- 0 
+            }
+            # survival of mother
+            if (passengerSelect$MotherNumber == 1){
+                mother <- parents[parents$Sex == 'female', ]
+                passengerSelect$MotherSurvivedDiff <- mother$Survived * 2 - 1
+            } else {
+                passengerSelect$MotherSurvivedDiff <- 0 
+            }
+        } else {
+            passengerSelect$ParentsSurvivedDiff <- 0
+            passengerSelect$FatherSurvivedDiff <- 0
+            passengerSelect$MotherSurvivedDiff <- 0
+        }
+        
+        # insert selected passenger into passenger set
+        passenger[iPassenger, ] <- passengerSelect
+    }
+    
+    # survival of relatives
+    passenger$RelativesSurvivedDiff <- 
+        passenger$SpouseSurvivedDiff + 
+        passenger$SiblingSurvivedDiff + 
+        passenger$ChildrenSurvivedDiff + 
+        passenger$ParentsSurvivedDiff
+    
+    passenger
+}
+
+passenger <- updateSurvivalFeatures(passenger)
+
+# now I reset the survival inforatmion of all passengers of the test set to NA
+passenger$Survived[passenger$DataSet == "Test"] <- NA
+
+```
+
+Additionally, I add some more features.
+
+```{r}
+# passenger travled alone
+passenger$IsAlone <- passenger$FamilySize == 1
+
+# passenger is a child
+passenger$IsChild <- passenger$Age <= 14
+
+# passenger's wife or husband survived (0 if passenger didn't have a wife or husband)
+passenger$HusbandSurvivedDiff <- 0
+passenger$HusbandSurvivedDiff[passenger$Sex == "female"] <- passenger$SpouseSurvivedDiff[passenger$Sex == "female"]
+passenger$WifeSurvivedDiff <- 0
+passenger$WifeSurvivedDiff[passenger$Sex == "male"] <- passenger$SpouseSurvivedDiff[passenger$Sex == "male"]
+
+# children of mother or father survived
+passenger$MothersChildrenSurvivedDiff <- 0
+passenger$MothersChildrenSurvivedDiff[passenger$Sex == "female"] <- passenger$ChildrenSurvivedDiff[passenger$Sex == "female"]
+passenger$FathersChildrenSurvivedDiff <- 0
+passenger$FathersChildrenSurvivedDiff[passenger$Sex == "male"] <- passenger$ChildrenSurvivedDiff[passenger$Sex == "male"]
+```
+
+Let's have a look at all features of the data set:
+
+```{r}
+# exclude features which are not relevant for prediction
+featureRemove <- c("Name", "Ticket", "Fare", "Cabin", "Embarked", "Surname", "MaidenName", "Firstname", "HusbandFirstname", "SiblingAgeMin", "SiblingAgeMax", "SiblingAgeMean", "ParentAgeMin", "ParentAgeMax", "ParentAgeMean", "ChildrenAgeMin", "ChildrenAgeMax", "ChildrenAgeMean", "SameTicketAgeMin", "SameTicketAgeMax", "SameTicketAgeMean", "SpouseAge", "CabinNr")
+names(passenger)[!(names(passenger) %in% featureRemove)]
+```
+
+* PassengerId: ID of passengers
+* Survived: 0 if passenger died, 1 if survived, NA if unknown (passenger in test set)
+* Pclass: class of passenger: 1, 2, or 3
+* Sex: gender: "female" or "male"
+* Age: age of passenger
+* IsChild: passenger is 14 years or younger
+* HasAge: 1 if passenger's age is in original data set, 0 if age was imputed
+* HasCabin: 1 if passenger's cabin is in original data set, 0 otherwise
+* Deck: deck of passenger's cabin (A-G)
+* CabinSide: ship side of passenger's cabin: "Unknown", "Port", or "Starboard"
+* SibSp: Number of siblings plus number of spouse aboard
+* SpouseNumber: Number of spouse aboard
+* SpouseId: passenger ID of passenger's spouse
+* SpouseSurvivedDiff: -1 if spouse died, 0 if passenger had no spouse, 1 if spouse survived
+* HusbandSurvivedDiff: -1 if husband died, 0 if passenger had no husband, 1 if husband survived
+* WifeSurvivedDiff: -1 if wife died, 0 if passenger had no wife, 1 if wife survived
+* SiblingNumber: Number of siblings aboard
+* SiblingId: passenger IDs of siblings
+* SiblingSurvivedDiff: difference of suvival of siblings: sibling died counts -1, survived +1
+* Parch: Number of parents plus number of children aboard
+* ChildrenNumber: Number of children aboard
+* ChildrenId: passenger IDs of children
+* ChildrenSurvivedDiff: difference of survival of children: child died counts -1, survived +1
+* MothersChildrenSurvivedDiff: difference of the survival of children of female passengers (0 if passenger is male or has no children)
+* FathersChildrenSurvivedDiff: difference of the survival of children of male passengers (0 if passenger is female or has no children)
+* ParentsNumber: Number of parents aboard
+* ParentsId: passenger IDs of parents
+* ParentsSurvivedDiff: difference of suvival of parents: parent died counts -1, survived +1
+* FatherNumber: father aboard: yes: 1, no: 0
+* FatherSurvivedDiff: -1 if father died, 0 if passenger's father was not aboard, 1 if father survived
+* MotherNumber: mother aboard: yes: 1, no: 0
+* MotherSurvivedDiff: -1 if mother died, 0 if passenger's mother was not aboard, 1 if mother survived
+* FamilySize: Sum of number of spouses, siblings, children, and parents
+* IsAlone: passenger traveld alone (FamilySize = 1)
+* RelativesSurvivedDiff: difference of survival of relatives: -1 if relative died, +1 if relative survived
+* SameTicketId: passenger IDs of all passengers with same ticket
+* SameTicketNumber: number of passengers with same ticket
+* SameTicketSurvivedDiff: difference of survival of passengers with same ticket
+* FarePerPerson: fare of passenger
+* Title: title of passenger: Mr, Mrs, Miss, Master, RareTitle, Rev, or Dr
+* DataSet: data set of passenger: "Training" or "Test" 
+
+Next, I do one-hot encoding of the categorical features Pclass, Sex, Title, Deck, and CabinSide. Furthermore, I map the Deck features which has values between A - G to numerical values (1 - 7) and name this feature DeckNumber. Although Pclass and Deck get one-hot encoded I leave the numerical versions in the data set to see if they work better as categorical or ordinal feature. 
+
+```{r}
+# map Deck feature to numerical feature
+passenger$DeckNumber <- NA
+letter <- c("A", "B", "C", "D", "E", "F", "G")
+for (i in 1:length(letter)){
+    passenger$DeckNumber[passenger$Deck == letter[i]] <- i
+}
+
+# features to be encoded
+featureEncode <- c("Pclass", "Sex", "Title", "Deck", "CabinSide")
+
+# one-hot encoding
+for (feature in featureEncode){
+    # get values of feature
+    values <- as.character(unique(passenger[, feature]))
+    for (value in values){
+        # create feature name
+        newFeatureName <- paste0(feature, "_", value)
+        # populate feature
+        passenger[, newFeatureName] <- passenger[, feature] == value
+    }
+}
+
+# remove original feature from data set
+passenger <- passenger[, !(names(passenger) %in% c("Sex", "Title", "Deck", "CabinSide"))]
+
+# copy passenger data set
+passengerOrg <- passenger
+
+# add relatives' id to feature remove
+featureRemove <- c(featureRemove, "SpouseId", "SiblingId", "ChildrenId", "ParentsId", "SameTicketId")
+
+# remove columns which are not used for prediction
+passenger <- passenger[, !(names(passenger) %in% featureRemove)]
+```
+
+These are all features of the data set:
+
+```{r}
+names(passenger)
+```
+
+Excluding PassengerId, Survived, and DataSet, there are 52 features which can be used for the survival prediction.
+
+# Feature Correlation
+
+In this section I analyse how the features of the data set are correlated with each other and the survival of the passengers. 
+
+First, I analyse the correlation with the passengers' survival. As the survival is not know for all passengers, I only analyse the training data set. 
+
+```{r, fig.height = 10, fig.width = 7}
+training <- passenger[passenger$DataSet == "Training", ]
+
+survived <- training$Survived
+
+# remove features which are not used for correlation analysis
+training <- select(training, -c(PassengerId, Survived, DataSet))
+
+# calculate correlation coefficient of each feature with survival
+feature <- names(training)
+
+corrSurvived <- data.frame(feature = feature, coef = rep(NA, length(feature)))
+for (iFeature in 1:length(feature)){
+    corrSurvived$coef[iFeature] <- cor(training[, iFeature], survived)
+}
+
+# sort by correlation coefficient
+corrSurvivedOrder <- corrSurvived[order(corrSurvived$coef, decreasing = FALSE), ]
+
+ggplot(corrSurvivedOrder, aes(x = factor(feature, levels = feature), y = coef)) + 
+    geom_bar(stat = "identity") + 
+    coord_flip() + 
+    xlab("Feature") + 
+    ylab("Correlation Coefficient")
+```
+
+The feature with the highest correlation with survival is Sex_female. This is mainly because of the women and children first policy. This also explains why Title_Mrs, and Title_Miss are the features with the next highest correlation. Interestingly, Mrs have a higher correlation than Miss, although passengers with title Miss were younger than Mrs passengers. One explanation for that could be that 3rd class passengers had a higher share of children. Since passengers of lower classes had lower survival chances, this could have affect passengers with title Miss. 
+
+Another feature with a high correlation with the passengers' survival is HasCabin. The main reason for this is that predominantly only passengers of the first class had information about their cabin. As these passengers were more likely to survive, there is a high correlation of HasCabin with the survival as well. 
+
+The feature with the next highest correlation is MotherSurvivedDiff. That's quite remarkable as only 12% of all passengers had their mother on board. Hence, for all passengers who had their mother on board, her survival is a very strong indicator of their survival as well. The correlation of FatherSurvivedDiff with the survival is much smaller with only 0.008. Thus, the survival of the father had almost no effect on the survival of the children. The effect of ChildrenSurvivedDiff on the survival of their parents is with 0.162 significantly lower which can be explained as the survival of fathers is not correleted with the survival of their children.
+
+Other features which are almost uncorrelated with the passengers' survival are Title_Dr, FamilySize, and ChildrenNumber. The reason why Title_Dr had a low correlation is that only 8 passenger have this title, hence it cannot have a significant relevance.
+
+The features with the most negative correlation with the passengers' survival are Title_Mr and Sex_male, which is again explainable by the fact that women got priority to be saved. Pclass is the next lowest correlated feature as first class passengers (Pclass = 1) had much better chances to survive than third class passengers. The feature CabinSide_Unknown is closely correlated with HasCabin - all passengers without cabin information were assigend to CabinSide_Unknown. 
+
+Another interesting aspect is that the Deck features' correlation factors are alpahbetically ordered with the only exception that deck A had a lower correlation than B, C, and D. The reason for this order is that first and second class passengers were on the upper decks while third class passengers stayed on the lower decks. Furthermore, it is possible that the farther the passengers were away from the lifeboats the more unlikely they were to reach them. The reason why fewer passengers on deck A survived is that 83% of all passengers on this deck were male. Possibly, this deck had only small cabins so that only singles stayed there.
+
+Next, I calculate the correlation of the features.
+
+```{r, fig.height = 12, fig.width = 12}
+# function to calculate plot feature correlation matrix
+getCorrMatrix <- function(featureList, showPlot = TRUE){
+    # remove Survived from training set and order feature with respect to correlation coefficient to survived
+    passengerCorr <- passenger[, as.character(featureList)]
+    # calculate correlation matrix
+    corrMatrix <- cor(passengerCorr)
+    # plot matrix
+    if (showPlot) {corrplot(corrMatrix, method = "color", type = "upper")}
+    corrMatrix
+}
+
+corrMatrix <- getCorrMatrix(rev(corrSurvivedOrder$feature))
+```
+
+The matrix above visulises the correlation matrix of all features. High positive correlation are shown in blue, high negative correlations in red, while white represents no correlation between two features. The features are ordered with respect to their correlation coefficient to survival from left to right. 
+
+```{r}
+# function to get data frame with pairwise correlation of features
+getPairCorrelation <- function(corrMatrix){
+    featureName <- colnames(corrMatrix)
+    nFeature <- length(featureName)
+    
+    # set lower triangle of matrix to NA (these values are all redundant)
+    corrMatrix[lower.tri(corrMatrix, diag = TRUE)] <- NA
+    
+    # convert matrix to data frame
+    featurePair <- data.frame(feature1 = rep(featureName, nFeature), feature2 = rep(featureName, each = nFeature), coef = as.vector(corrMatrix))
+    # remove NAs
+    featurePair <- featurePair[!is.na(featurePair$coef), ]
+    # calculate absolute value of correlation coefficient
+    featurePair$coefAbs <- abs(featurePair$coef)
+    # order by coefficient
+    featurePair <- featurePair[order(featurePair$coefAbs, decreasing = TRUE), ]
+    
+    featurePair
+}    
+
+featureCorr <- getPairCorrelation(corrMatrix)    
+```
+
+Lets have a look at the ten feature pairs with the highes correlations:
+
+```{r}
+kable(featureCorr[1:10, ]) %>% kable_styling(full_width = FALSE)
+```
+
+Since the passengers' gender is either male or female its no surprise that Sex_male and Sex_female are 100% correlated with each other. Since the majority of the cabins is unknown, there is also a high correlation between HasCabin and CabinSide_Unknown. SibSp includes the number of spouses plus number of siblings. As the number of siblings can be higher than the number of spouses, SibSp and SiblingNumber are strongly correlated. ParentsNumber is MotherNumber + FatherNumber so again this high correlation makes sense. As Pclass_1-3 is derived from Pclass, these features are also strongly correlated. The correlation between RelativesSurvivedDiff and SameTicketSurvivedDiff can be explained as mainly relatives shared the same ticket. Since most male have the title Mr, this feature has a high correlation with Sex_male and Sex_female. 
+
+```{r}
+# plot histogram of correlation factors
+ggplot(featureCorr, aes(coef)) + geom_histogram(binwidth = 0.1) + xlab("Correlation Coefficient")
+```
+
+The histogram above shows the frequency of correlation coefficients among all feature pairs. It shows that the majority of features is only weakly correlated. Nevertheless, there are in total 97 pairs of features which have an absolut correlation coefficient of more than 0.5. It certainly makes sense to reduce these pairs as they are very unlikely to contribute any further information and are very likely to cause overfitting. 
+
+# Feature Reduction
+
+In this section I will apply three approaches to reduce the number of features. First, I will use a greedy algorithm to eliminate features with respect to their correlation to other features. The other approach is to use logistic regression with L1 regularisation to select features with respect to their corresponding weight. And finally I will apply Principle Component Analysis (PCA) to transform all features to a space with fewer dimensions.
+
+## Greedy Elimination
+
+The idea of this approach is to iteratively elimnate features with respect to their correlation to other features. Therefore, the feature pair with the highest absolute correlation coefficient is selected. The feature of this pair which has the lower correlation with the passengers' survival is eliminated. This procedure is repeated until no features are left. 
+
+The revesre order of elimination shall be the order of selecting features. For example if five features shall be selected for predction than the five features which were eliminated last are to be chosen.
+
+```{r}
+# features to be eliminated
+nFeature <- length(corrSurvivedOrder$feature)
+featureEliminate <- character(nFeature)
+
+# data frame with all features 
+featureRest <- featureCorr
+featureRest$feature1 <- as.character(featureRest$feature1)
+featureRest$feature2 <- as.character(featureRest$feature2)
+
+# calculate absolute value of correlation coefficient with survival
+corrSurvived$coefAbs <- abs(corrSurvived$coef)
+
+for (iFeature in 1:(nFeature - 1)){
+    # get correlation coefficient to survival
+    coefAbs1 <- corrSurvived$coefAbs[corrSurvived$feature == featureRest$feature1[1]]
+    coefAbs2 <- corrSurvived$coefAbs[corrSurvived$feature == featureRest$feature2[1]]
+    
+    # choose which feature has lower absolute correlation coefficient to survival
+    if (coefAbs1 <= coefAbs2) {
+        # eliminate feature 1
+        featureRemove <- featureRest$feature1[1]
+        featureKeep <- featureRest$feature2[1]
+    } else {
+        # eliminate feature 2
+        featureRemove <- featureRest$feature2[1]
+        featureKeep <- featureRest$feature1[1]
+    }
+    
+    # add selected feature to elimination list
+    featureEliminate[iFeature] <- featureRemove
+    
+    # remove feature from featureRest
+    featureRest <- featureRest[featureRest$feature1 != featureRemove & featureRest$feature2 != featureRemove, ]
+}
+
+# add last remaining feature to elimination list
+featureEliminate[nFeature] <- featureKeep
+
+# reverse elimination list
+featureGE <- rev(featureEliminate)
+
+featureGE
+```
+
+This is the order how features should be selected in order to have a selction of least correlated features. For example, if five features shall be chosen it would be Title_Mr, MothersChildrenSurvivedDiff, Title_Dr, Title_Rev, and Pclass. It must be kept in mind that this order does not reflect the importance of features, e.g. as almost no passenger has the title Dr, this feature will not be very predictive for survival, the reason why it was chosen is that it is least correlated to Title_Mr and ChildrenSurvivedDiff. 
+
+Below, I plot a correlation matrix with all features of this list. The features are in the same order as they should be chosen, starting with the first feature (Title_Mr) on the most left. The matrix shows that the first features in the top left corner have low correlation whereby the farther we go to the bottom right corner the stronger the correlations become - these are the features which should be selected last or even not selected at all. 
+
+```{r, fig.height = 12, fig.width = 12}
+corrMatrixGE <- getCorrMatrix(featureGE)
+```
+
+The histogram below shows the distribution of the correlation coefficient of all feature pairs if 5, 10, 20, or 40 features shall be chosen. As 5 features have much fewer pair combinations than 40 features, the heights of the corresponding bars are much lower. The diagram shows that the standard deviation increases with the number of features - the more features are chosen the more they are correlated with each other. For 5 features the standard deviation is 0.068, while the correlation coefficient of 40 features has a standard deviation of 0.198.
+
+```{r, warning = FALSE}
+# plot histograms for 5, 10, 20, and 40 features
+
+# get pairwise correlations
+featurePairGE5 <- getPairCorrelation(corrMatrixGE[1:5, 1:5])
+featurePairGE10 <- getPairCorrelation(corrMatrixGE[1:10, 1:10])
+featurePairGE20 <- getPairCorrelation(corrMatrixGE[1:20, 1:20])
+featurePairGE40 <- getPairCorrelation(corrMatrixGE[1:40, 1:40])
+
+# add column with number of features
+featurePairGE5$nFeature <- 5
+featurePairGE10$nFeature <- 10
+featurePairGE20$nFeature <- 20
+featurePairGE40$nFeature <- 40
+
+# combine all data frames
+featurePairGE <- do.call("rbind", list(featurePairGE5, featurePairGE10, featurePairGE20, featurePairGE40))
+featurePairGE$nFeature <- factor(featurePairGE$nFeature, levels = c(40, 20, 10, 5))
+
+# plot histograms
+ggplot(featurePairGE) + 
+    geom_histogram(aes(x = coef, fill = nFeature), binwidth = 0.1) + 
+    xlab("Correlation Coefficient") +
+    labs(fill = "Number of Features") +
+    xlim(-1, 1)
+```
+
+## Recursive Feature Elimination (RFE)
+
+Another option to reduce the number of features is Recursive Feature Elimination (RFE). The idea is very similar to greedy elimination, however, here features are eliminated with respect to their importance. There are many possiblities to evalute the importance of features. In this kernel I do logistic regression and calculate the features' p-value. The lower the p-value the more relevant the feature. Thus, features with the highest p-value get eliminated first until the selected number of features is reached. 
+One problem of this approach is that when having correlated features, their importance could be reduced. For example, if feature A and B are correlated, they may both do not high importance. However, when feature A is removed the importance of B would increase and make it an important feature. Therefore, the importance (respectively p-value) of features should be updated after the removal of features. In order to do this, I recalculate the p-value of all features everytime I eliminated five features. 
+
+```{r}
+# number of features to be eliminated after each fit
+nEl <- 5
+
+# prepare data for fit
+XTrain <- select(passenger[passenger$DataSet == "Training", ], -c(PassengerId, Survived, DataSet))
+yTrain <- passenger$Survived[passenger$DataSet == "Training"]
+dataFit <- XTrain
+for (i in 1:ncol(dataFit)){
+    dataFit[, i] <- as.numeric(dataFit[, i])
+}
+dataFit$Survived <- yTrain
+
+orderFeatureByPValue <- function(dataFit){
+
+    # fit logistic regression model
+    LRFit <- glm(Survived ~ ., family = binomial(), data = dataFit)
+    
+    # get features which were not fitted
+    featureNotFit <- names(LRFit$coefficients[is.na(LRFit$coefficients)])
+    nFeatureNotFit <- length(featureNotFit)
+    
+    # check if there are features which were not fitted
+    if (nFeatureNotFit > 1){
+        # get order of these features by fitting model with these features only
+        featureOrderNF <- orderFeatureByPValue(dataFit[, names(dataFit) %in% c(featureNotFit, "Survived")])
+    } else {
+        featureOrderNF <- featureNotFit
+    }
+    
+    # get coefficients of fitted features
+    coefStat <- coef(summary(LRFit))
+    # remove intercept
+    coefStat <- coefStat[-1, ]
+    
+    # order fitted features by their p-value
+    featureOrderF <- rownames(coefStat)[order(coefStat[, 4])]
+    
+    # combine features
+    c(featureOrderF, featureOrderNF)
+}
+
+# number of remaining features
+nR <- ncol(dataFit) - 1
+
+featureRFE <- character(0)
+
+# remove nEl features per iteration
+while(nR > 0){
+    # get data of remaining features
+    dataFit <- dataFit[, !(names(dataFit) %in% featureRFE)]
+    
+    # get order of remaining features
+    featureOrder <- orderFeatureByPValue(dataFit)
+    
+    # eliminate features
+    featureRFE <- c(rev(rev(featureOrder)[1:min(nEl, nR)]), featureRFE)
+    
+    nR <- nR - nEl
+}
+
+featureRFE
+```
+
+Above is the order selected features via RFE. Title_Mr is in RFE as well as GE the most important features. MothersChildrenSurvivedDiff, Pclass and Title_RareTitle are among the most important features of both methods. An apparent difference between the two methods is that RFE has more family related features like SameTicketSurvivedDiff, ParentsSurvivedDiff, FatherNumber and Parch within its top features. As these features are stronger correlated with each other, they were ranked lower by GE, however, it seems that their importance is quite high so they got higher ranks by RFE.
+
+## Lasso Regularision
+
+I apply [logistic regression with L1 regularisation (Lasso)](https://blog.alexlenail.me/what-is-the-difference-between-ridge-regression-the-lasso-and-elasticnet-ec19c71c9028) to identify which features should be selected. L1 regularisation means, that another term with respect to the absolute value of the weights is added to the objective function which has to be minimised in order to obtain the ideal weights. Adding the regularisation term forces the optimiser to reduce the weights so that the danger of overfitting is reduced. A parameter lamda is used to adjust the regularisation effect, higher values of lambda forces the optimiser the reduce the features' weights. The interesting thing about L1 regularisation is that it turns out to reduce the weights of some features to 0. Therewith, it is possible to eliminate features by varying lambda. 
+
+```{r}
+lambda <- 10 ^ seq(from = 0, to = -7, by = -0.01)
+
+XTrain <- as.matrix(XTrain)
+
+# get minimum and maximum of each column
+getColMinMax <- function(data){
+    nCol <- ncol(data)
+    colMin <- rep(NA, nCol)
+    colMax <- rep(NA, nCol)
+    for (iCol in 1:nCol){
+        colMin[iCol] <- min(data[, iCol])
+        colMax[iCol] <- max(data[, iCol])
+    }
+    list("min" = colMin, "max" = colMax)
+}
+# function to normalise data
+normData <- function(data, colMinMax){
+    for (iCol in 1:ncol(data)){
+        data[, iCol] <- (data[, iCol] - colMinMax$min[iCol]) / (colMinMax$max[iCol] - colMinMax$min[iCol])
+    }
+    data
+}
+
+# normalise data
+colMinMax <- getColMinMax(XTrain)
+XTrain <- normData(XTrain, colMinMax)
+
+logRegModel <- glmnet(XTrain, yTrain, family = "binomial", alpha = 1, lambda = lambda)
+
+# get weights
+weights <- as.matrix(coef(logRegModel))
+featureSelect <- weights[2:(nFeature + 1), ] != 0 # remove first row as this row contains the intercept
+featureName <- rownames(featureSelect)
+
+# get number of selected features
+nFeatureSelect <- colSums(featureSelect)
+
+# plot number of selected features
+plotData <- data.frame(lambda = lambda, nFeature = nFeatureSelect)
+ggplot(plotData, aes(x = lambda, y = nFeature))+ geom_line() + scale_x_log10() + xlab("Lambda") + ylab("Number of Features")
+```
+
+The diagram above shows how many features were selected with respect to lambda. The higher lamda became, the fewer features were selected. The  number of selected feature is not decreasing monotonously, sometimes there are also increases in the number of features. Furthermore, the diagram shows that sometimes the number of features decreases very fast. Here, more than one feature was dropped within one step of increasing lambda. The order of these features is selected with respect to their weights: features with the lowest absolute weight are to be removed first. 
+
+```{r}
+# number lambdas
+nLambda <- length(lambda)
+
+# get index when feature appeared first
+featureOrder <- data.frame(name = featureName, index = rep(nLambda + 1, nFeature), weightAbs = rep(NA, nFeature))
+for (iFeature in 1:nFeature){
+    index <- which(featureSelect[iFeature, ])
+    # check if feature appeared
+    if (length(index) > 0){
+        featureOrder$index[iFeature] <- index[1]
+        featureOrder$weightAbs[iFeature] <- abs(weights[iFeature + 1, index[1]])
+    }
+}
+
+# order by index
+featureOrder <- featureOrder[order(featureOrder$index, -featureOrder$weightAbs), ]
+
+featureLG <- as.character(featureOrder$name)
+featureLG
+```
+
+The order of the selected features is very similar to the order of features with the highest absolute correlation to survival. Title_Mr is the feature with the highest absolute correlation, followed by Sex_male, Sex_female, and Title_Mrs. It is interesting to see that there are many pairs of highly correlated features among the selected top features like: Sex_male - Sex_female or HasCabin - CabinSide_Unknown. These pairs could cause overfitting.
+
+## Principle Component Analysis (PCA)
+
+[PCA](http://www.sthda.com/english/articles/31-principal-component-methods-in-r-practical-guide/118-principal-component-analysis-in-r-prcomp-vs-princomp/) is a method to reduce the number of dimensions (each dimension is a prinicple component) of a data set while keeping the variance of the transformed data set as high as possible. Each feature of the transformed data set is a linear combination of all features of the input data set. Unfortunately, this makes the interpretation regarding the importance of each feature on the prediction result very difficult.
+
+First of all, I run PCA for different number of dimensions to analyse their effect on the variance of the transformed data set. 
+
+```{r}
+# convert data set to matrix
+trainingMatrix <- as.matrix(XTrain)
+
+# execute PCA on training data
+pcaTraining <- summary(prcomp(trainingMatrix, scale. = TRUE))
+
+# plot cummulated R2 with respect to number of components
+plotData <- data.frame(component = 1:nFeature, R2 = pcaTraining$importance[3, ])
+
+ggplot(plotData, aes(x = component, y = R2)) + geom_line() + ylim(0, 1)
+```
+
+This graph shows the [R-squared (R2) values](https://towardsdatascience.com/coefficient-of-determination-r-squared-explained-db32700d924e) with respect to the number of principle components. The R2 value describes how much of the variance of the original data set can be explained by the transformed data set. When R2 is one, the variance of both sets is identical. 
+
+It can be seen that R2 increases very fast at low numbers of components and saturates to 1 once 37 components are reached. Thus, all further components are not neccesary to describe the whole variance of the original data set. 18 components are neccesary to describe 95% of the original data set's variance. 
+
+Now I calculate the correlation between each component with the passengers' survival.
+
+```{r, fig.height = 8, fig.width = 5}
+nComp <- 37
+corrPCA <- rep(NA, nComp)
+XPCA <- pcaTraining$x
+for (i in 1:nComp){
+    corrPCA[i] <- cor(XPCA[, i], yTrain)
+}
+
+plotData <- data.frame(component = 1:nComp, coef <- corrPCA)
+ggplot(plotData, aes(x = factor(component, levels = rev(component)), y = coef)) + 
+    geom_bar(stat = "identity") + 
+    coord_flip() + 
+    xlab("Component") + 
+    ylab("Correlation Coefficient") + 
+    ylim(-0.6, 0.6)
+```
+
+The diagram shows that the first four components have the highest absolute correlation with the passengers' survival. Most other components have absolute correlations of less than 0.1. The figure also shows that the correlations fluctuate quite strongly. This means that there are also components which did not contribute much to the varience of the model but still are correlated with the passengers' survival. 
+
+# Prediction
+
+The final part of this kernel is to test the generated data sets by using them as training set for different predictors and assess their performance by analysing the prediction accuracy. Therefore, I will use random forest and support vector machines (SVM) as predictors and use different numbers of features (respectively components) to predict the passengers' survival. As different numbers of features may require different hyperparameters I will do hyperparameter tuning as well.
+
+First of all I need to prepare the data sets. I will use 20% of the data as test set, the remaining data will be used for training and validation whereby I will do [5-fold cross-validation](https://en.wikipedia.org/wiki/Cross-validation_(statistics)).
+
+```{r}
+nFold <- 5
+
+# get passengers with survival information
+passengerTrain <- passenger[passenger$DataSet == "Training", ]
+X <- as.matrix(select(passengerTrain, -c(PassengerId, Survived, DataSet)))
+y <- passengerTrain$Survived
+
+set.seed(0)
+
+# number of observations
+nObs <- nrow(X)
+
+# split test and train-validation data
+iShuffle <- sample.int(n = nObs, size = nObs, replace = FALSE)
+X <- X[iShuffle, ]
+y <- y[iShuffle]
+
+# number of test samples
+nTest <- round(nObs * 0.2)
+nTrainVal <- nObs - nTest
+
+XTest <- X[1:nTest, ]
+yTest <- y[1:nTest]
+XTrainVal <- X[(nTest + 1):nObs, ]
+yTrainVal <- y[(nTest + 1):nObs]
+
+# split data into folds
+XFold <- vector("list", nFold)
+yFold <- vector("list", nFold)
+for (i in 1:nFold){
+    iStart <- round((i - 1) * nTrainVal / nFold + 1)
+    iEnd <- round(i * nTrainVal / nFold )
+    XFold[[i]] <- XTrainVal[iStart:iEnd, ]
+    yFold[[i]] <- as.vector(yTrainVal[iStart:iEnd])
+}
+
+# split train-validation data into nFolds whereby nFold - 1 sets are used for training and one set for validation
+XTrainFold <- vector("list", nFold)
+XValFold <- vector("list", nFold)
+yTrainFold <- vector("list", nFold)
+yValFold <- vector("list", nFold)
+
+iFold <- 1:nFold
+for (i in iFold){
+    iTrain <- iFold[iFold != i]
+    XTrainFold[[i]] <- XFold[[iTrain[1]]]
+    yTrainFold[[i]] <- yFold[[iTrain[1]]]
+    for (iAppend in iTrain[2:(nFold -1)]){
+        XTrainFold[[i]] <- rbind(XTrainFold[[i]], XFold[[iAppend]])
+        yTrainFold[[i]] <- c(yTrainFold[[i]], yFold[[iAppend]])
+    }
+    XValFold[[i]] <- XFold[[i]]
+    yValFold[[i]] <- yFold[[i]]
+}
+```
+
+## Support Vector Machine
+
+First I use [SVMs](https://en.wikipedia.org/wiki/Support_vector_machine) for prediction. I will use all three data sets which I derived with 5, 10, 20, 30, 40, and 52 (all features). 
+
+I will use the training set of each fold to train the model and tune hyperparameter to make predictions on the validation set. The model with the highest average accuracy among all sets is then chosen to be trained on the training and validation data to predict the survival of the test data set. I will compare these accuracies for different numbers of features.
+
+```{r}
+# function to tune hyperparameter and calculate accuracy for different feature selections
+calculateAccFeatureSelect <- function(featureSelectName, predictorName, nFeature, hp){
+    
+    # get order of features
+    if (featureSelectName == "GE"){
+        featureOrder <- featureGE
+        useFeatureOrder <- TRUE
+    } else if (featureSelectName == "LG"){
+        featureOrder <- featureLG
+        useFeatureOrder <- TRUE
+    } else if (featureSelectName == "RFE"){
+        featureOrder <- featureRFE
+        useFeatureOrder <- TRUE
+    } else if (featureSelectName == "PCA"){
+        useFeatureOrder <- FALSE
+    } else {
+        stop("unknown feature selection")
+    }
+
+    # number of hyperparameter
+    nHp <- length(hp)
+    
+    nNFeature <- length(nFeature)
+    accuracyNFeature <- data.frame(nFeature = nFeature)
+    accuracyNFeature$predictor <- predictorName
+    accuracyNFeature$featureSelect <- featureSelectName
+    accuracyNFeature$hyperparameter <- NA
+    accuracyNFeature$accVal <- NA
+    accuracyNFeature$accTest <- NA
+    
+    # iterate through number of features
+    for (iFeature in 1:nNFeature){
+        if (featureSelectName %in% c("GE", "LG", "RFE")){
+            # names of selected features
+            featureSelect <- featureOrder[1:nFeature[iFeature]]
+        }
+        
+        # average accuracy of hyperparameter
+        accHp <- rep(NA, nHp)    
+        
+        # iterate through hyper parameter
+        for (iHp in 1:nHp){
+            # skip this iteration if random forest is chosen and number of features exceeds hyperparameter
+            if ((predictorName == "RF") && (nFeature[iFeature] < hp[iHp])) {
+                accHp[iHp] <- -1
+                next
+            }
+            
+            # accuracy of set
+            accFold <- rep(NA, nFold)
+        
+            # iterate through folds
+            for (iFold in 1:nFold){
+                XTrainSelect <- XTrainFold[[iFold]]
+                XValSelect <- XValFold[[iFold]]                
+                yTrainSelect <- yTrainFold[[iFold]]
+                yValSelect <- yValFold[[iFold]]
+                if (useFeatureOrder){
+                    # prepare training and validation data
+                    XTrainSelect <- XTrainSelect[, colnames(XTrainSelect) %in% featureSelect]
+                    XValSelect <- XValSelect[, colnames(XValSelect) %in% featureSelect]
+                } else {
+                    # transform data with PCA
+                    pcaModel <- prcomp(XTrainSelect, scale. = TRUE)
+                    XTrainSelect <- pcaModel$x[, 1:nFeature[iFeature]]
+                    XValFull <- predict(pcaModel, XValSelect)
+                    XValSelect <- XValFull[, 1:nFeature[iFeature]]
+                }
+                
+                # fit model
+                if (predictorName == "SVM"){
+                    model <- svm(XTrainSelect, as.factor(yTrainSelect), scale = TRUE, kernel = "radial", gamma = hp[iHp])
+                } else if (predictorName == "RF") {
+                    model <- randomForest(XTrainSelect, as.factor(yTrainSelect), ntree = 100, mtry = hp[iHp])
+                } else {
+                    stop("Unknown predictor")
+                }
+                # predict survival
+                predVal <- as.numeric(predict(model, XValSelect)) - 1
+                # calculate accuracy
+                accFold[iFold] <- mean(yValSelect == predVal)
+            }
+            
+            # calcualte average accuracy of hyperparameter
+            accHp[iHp] <- mean(accFold)
+        }
+        
+        # select hyperparameter with highest accuracy
+        iHpBest <- which.max(accHp)
+        
+        # get best hyperparameter
+        hpBest <- hp[iHpBest]
+        
+        # insert validation accuracy to data frame
+        accuracyNFeature$accVal[iFeature] <- accHp[iHpBest]
+        
+        # combine training and validation data and select features
+        XTrainVal <- rbind(XTrainFold[[1]], XValFold[[1]])
+        yTrainVal <- c(yTrainFold[[1]], yValFold[[1]])
+        
+        if (useFeatureOrder){
+            XTrainVal <- XTrainVal[, colnames(XTrainVal) %in% featureSelect]
+            XTestSelect <- XTest[, colnames(XTest) %in% featureSelect]
+        } else {
+            # transform data with PCA
+            pcaModel <- prcomp(XTrainVal, scale. = TRUE)
+            XTrainVal <- pcaModel$x[, 1:nFeature[iFeature]]
+            XTestFull <- predict(pcaModel, XTest)
+            XTestSelect <- XTestFull[, 1:nFeature[iFeature]]
+        }
+            
+        # train model with best hyperparameter on train and validation data
+        if (predictorName == "SVM"){
+            model <- svm(XTrainVal, as.factor(yTrainVal), scale = TRUE, kernel = "radial", gamma = hpBest)
+        } else if (predictorName == "RF"){
+            # check if hyper parameter is valid
+            if (hpBest > nFeature[iFeature]) {
+                # set hyperparameter to maximum value
+                hpBest <- nFeature[iFeature]
+            }
+            model <- randomForest(XTrainVal, as.factor(yTrainVal), ntree = 100, mtry = hpBest)
+        }
+        
+        # insert best hyperparameter
+        accuracyNFeature$hyperparameter[iFeature] <- hpBest
+        
+        # predict survival on test set
+        predTest <- as.numeric(predict(model, XTestSelect)) - 1
+        
+        # calculate accuracy
+        accTest <- mean(yTest == predTest)
+        
+        # insert accuracy to data frame
+        accuracyNFeature$accTest[iFeature] <- accTest
+    }
+    accuracyNFeature
+}
+```
+
+```{r}
+# hyperparameter
+hp <- c(0.0003, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3)
+
+# calculate accuracies of GE, LG, and PCA feature selection with SVM
+accuracyAll <- calculateAccFeatureSelect("GE", "SVM", c(5, 10, 20, 30, 40, 52), hp)
+accuracyAll <- rbind(accuracyAll, calculateAccFeatureSelect("LG", "SVM", c(5, 10, 20, 30, 40, 52), hp))
+accuracyAll <- rbind(accuracyAll, calculateAccFeatureSelect("RFE", "SVM", c(5, 10, 20, 30, 40, 52), hp))
+accuracyAll <- rbind(accuracyAll, calculateAccFeatureSelect("PCA", "SVM", c(5, 10, 20, 30, 37, 52), hp))
+```
+
+```{r}
+# plot accuracy of SVM
+ggplot(accuracyAll[accuracyAll$predictor == "SVM", ], aes(x = nFeature, y = accTest, color = as.factor(featureSelect))) + 
+    geom_line() + 
+    xlab("Number of Features") +
+    ylab("Test Accuracy") +
+    labs(color = "Feature Selection") + 
+    ylim(0.77, 0.86)
+```
+
+The diagram shows the test accuracy of the different feature selection methods with respect to the number of selected features. Interestingly, PCA (Principle Component Analysis) has the best accuracy at five features, while GE (Greedy Elimination) and LG (Lasso Regularisation) perform worse for this number of features. For more than five features, GE and LG outperform PCA, while RFE has the lowest accuracy. The highest accuracy is 85.4%, reached by PCA with five features. When 40 features are used all four methods have very similar accuracy. At the maximum number of 52 features, of course all features of GE, RFE, and LG are identical and so is their accuracy. While these three seems to overfit, PCA performs better for this number of features. 
+
+Although the highest accuracy was reach with PCA, I prefer LG as its accuracy is more stable between 10 and 40 features. I make a prediction on the test data set with LG and 20 features to make a submission and get the public score of this setup.
+
+```{r}
+# number of selected features
+nFeatureSelect <- 20
+hp <- 0.03
+
+# combine all data sets
+XComb <- passenger[passenger$DataSet == "Training", ]
+yComb <- XComb$Survived
+XSub <- passenger[passenger$DataSet == "Test", ]
+
+# select features
+XComb <- as.matrix(XComb[, names(XComb) %in% featureLG[1:nFeatureSelect]])
+XSub <- as.matrix(XSub[, names(XSub) %in% featureLG[1:nFeatureSelect]])
+
+# train model
+model <- svm(XComb, as.factor(yComb), scale = TRUE, kernel = "radial", gamma = hp)
+# predict 
+solutionLGSVM <- as.numeric(predict(model, XSub)) - 1
+
+# create data frame for submission
+df <- data.frame(PassengerId = passenger$PassengerId[passenger$DataSet == "Test"], Survived = solutionLGSVM)
+# submit prediction
+write.csv(df, "solutionLGSVM.csv", row.names = FALSE)
+```
+
+## Random Forest (RF)
+
+The other classifier I'm using in this kernel is [Random Forest (RF)](https://en.wikipedia.org/wiki/Random_forest). Again, I train this model with the same data sets as I did with SVM. The hyperparamter I'm tuning for RF is mtry. This parameter limits the number of features which are radomly selected to split a node of a decision tree. I vary this parameter from 5 to 40. 
+
+```{r}
+# hyper parameter
+hp <- c(5, 10, 20, 30, 40)
+set.seed(0)
+
+# calculate accuracies of GE, LG, and PCA feature selection with random forest (RF)
+accuracyAll <- rbind(accuracyAll, calculateAccFeatureSelect("GE", "RF", c(5, 10, 20, 30, 40, 52), hp))
+accuracyAll <- rbind(accuracyAll, calculateAccFeatureSelect("LG", "RF", c(5, 10, 20, 30, 40, 52), hp))
+accuracyAll <- rbind(accuracyAll, calculateAccFeatureSelect("RFE", "RF", c(5, 10, 20, 30, 40, 52), hp))
+accuracyAll <- rbind(accuracyAll, calculateAccFeatureSelect("PCA", "RF", c(5, 10, 20, 30, 37, 52), hp))
+```
+
+```{r}
+accuracyRF <- accuracyAll[accuracyAll$predictor == "RF", ]
+ggplot(accuracyRF, aes(x = nFeature, y = accTest, color = as.factor(featureSelect))) + 
+    geom_line() + 
+    xlab("Number of Features") +
+    ylab("Test Accuracy") +
+    labs(color = "Feature Selection") + 
+    ylim(0.77, 0.86)
+```
+
+In contrast to SVM, PCA performs much worse then GE, RFE, and LG. Furthermore, there is also a clear difference between GE, RFE and LG, as LG has the highest accuracy followed by RFE and GE. Obviously, RF is more sensitive to the selection of features than SVM. The highest accuracy on the test set was 86.0% (0.6% better than SVM) with LG and 30 features. 
+
+I run a RF model on the whole data with this setup to make a submission to the leader board.
+
+```{r}
+# number of selected features
+nFeatureSelect <- 30
+hp <- 10
+set.seed(0)
+
+# combine all data sets
+XComb <- passenger[passenger$DataSet == "Training", ]
+yComb <- XComb$Survived
+XSub <- passenger[passenger$DataSet == "Test", ]
+
+# select features
+XComb <- as.matrix(XComb[, names(XComb) %in% featureLG[1:nFeatureSelect]])
+XSub <- as.matrix(XSub[, names(XSub) %in% featureLG[1:nFeatureSelect]])
+
+# train model
+model <- randomForest(XComb, as.factor(yComb), ntree = 100, mtry = hp)
+# predict 
+solutionLGRF <- as.numeric(predict(model, XSub)) - 1
+
+# create data frame for submission
+df <- data.frame(PassengerId = passenger$PassengerId[passenger$DataSet == "Test"], Survived = solutionLGRF)
+# submit prediction
+write.csv(df, "solutionLGRF.csv", row.names = FALSE)
+```
+
+# Conclusion
+
+The results show that training prediction models with too many correlated features reduces their accuracy. On the example of the analysed data set, a reduction from 52 to 10 - 30 features led to the best results. Three different methods to reduce the number of correlated features were analysed:
+
+* Greedy Elimination (GE): iteratively eliminate feature of highest correlated feature pair
+* Recursive Feature Elimination (RFE): recursive elimination of features with respect to their importance
+* Lasso Regulariosion (LR): use L1 regularisation to remove features with zero weight
+* Principle Component Analysis (PCA): transform data set with PCA and choose components with highest variations
+
+These methods were evaluated by using their produced data sets to train Support Vector Machine and Random Forest classifiers. Thereby, the LR method led to the highest accuracy, while PCA performed worse. Furthermore, the difference regarding the accuracy of the different selection method was much hihger for Random Forest than for Support Vector Machines. 
+
+The best accuracy on a test set was 86.0%. I put this data set as output of this kernel.
+
+```{r}
+# get selected features
+featureSelect <- featureLG[1:30]
+# remove Sex_female as this feature is redundant
+featureSelect <- featureSelect[featureSelect != "Sex_female"]
+# names of features to be added to selection
+featureAdd <- c("PassengerId", "DataSet", "Survived", "SameTicketId", "ChildrenId", "ParentsId", "SpouseId")
+# select passenger set with all features
+passengerOutput <- passengerOrg[, c(featureSelect, featureAdd)]
+
+# replace empty integers by NA
+passengerOutput$SpouseId[sapply(passengerOrg$SpouseId, length) == 0] <- NA
+passengerOutput$ChildrenId[sapply(passengerOrg$ChildrenId, length) == 0] <- NA
+passengerOutput$ParentsId[sapply(passengerOrg$ParentsId, length) == 0] <- NA
+passengerOutput$SameTicketId[passengerOrg$SameTicketNumber == 1] <- NA
+
+# replace lists by comma separated strings
+for (i in 1:nrow(passengerOutput)){
+    if (length(passengerOutput$ChildrenId[[i]]) > 1){
+        passengerOutput$ChildrenId[i] <- paste(as.character(passengerOutput$ChildrenId[[i]]), collapse = ";")
+    }
+    if (length(passengerOutput$ParentsId[[i]]) > 1){
+        passengerOutput$ParentsId[i] <- paste(as.character(passengerOutput$ParentsId[[i]]), collapse = ";")
+    }
+    if (length(passengerOutput$SameTicketId[[i]]) > 1){
+        passengerOutput$SameTicketId[i] <- paste(as.character(passengerOutput$SameTicketId[[i]]), collapse = ";")
+    }    
+}
+
+# convert lists to characters
+passengerOutput$SpouseId <- as.character(passengerOutput$SpouseId)
+passengerOutput$ChildrenId <- as.character(passengerOutput$ChildrenId)
+passengerOutput$ParentsId <- as.character(passengerOutput$ParentsId)
+passengerOutput$SameTicketId <- as.character(passengerOutput$SameTicketId)
+
+# order by passenger id
+passengerOutput <- passengerOutput[order(passengerOutput$PassengerId), ]
+
+# save passenger data set
+write.csv(passengerOutput, file = "passenger29F.csv")
+```

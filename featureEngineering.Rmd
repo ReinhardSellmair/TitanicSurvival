@@ -1,0 +1,995 @@
+---
+title: "Imputation and Feature Engineering"
+author: "Reinhard Sellmair"
+date: "29 January 2018"
+output:
+  html_document:
+    number_sections: yes
+    toc: yes
+    code_folding: hide
+  pdf_document:
+    toc: yes
+---
+
+# Introduction
+
+In this kernel I'm doing some feature engineering based on the data set which was built by the kernel https://www.kaggle.com/reisel/titanic/save-the-families. In this kernel I matched relatives to each other - I matched passengers that were married with each other, found out which passengers were siblings and also linked passenges with their parents and children. 
+In this kernel I'm going to use these relations to impute or correct feature values and create new features. 
+
+# Pre-processing data
+
+First I load the data set from my other script and do some preprocessing.
+
+```{r, message=FALSE, warning = FALSE}
+# load packages
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(mice)
+library(stringr)
+library(kableExtra)
+
+# set seed
+set.seed(0)
+```
+
+```{r, cache = FALSE}
+
+# load data
+passenger <- read.csv("../input/save-the-families/passenger.csv")
+
+# change data types
+passenger$Name <- as.character(passenger$Name)
+passenger$Ticket <- as.character(passenger$Ticket)
+passenger$Cabin <- as.character(passenger$Cabin)
+passenger$Surname <- as.character(passenger$Surname)
+passenger$MaidenName <- as.character(passenger$MaidenName)
+passenger$Firstname <- as.character(passenger$Firstname)
+passenger$SiblingId <- as.character(passenger$SiblingId)
+passenger$ChildrenId <- as.character(passenger$ChildrenId)
+passenger$ParentsId <- as.character(passenger$ParentsId)
+passenger$HusbandFirstname <- as.character(passenger$HusbandFirstname)
+passenger$SiblingId <- as.list(passenger$SiblingId)
+passenger$ChildrenId <- as.list(passenger$ChildrenId)
+passenger$ParentsId <- as.list(passenger$ParentsId)
+
+# remove "X" column
+passenger <- select(passenger, -X)
+
+# convert passenger ids of relatives from character to lists of integers
+for (i in 1:dim(passenger)[1]){
+    passengerSelect <- passenger[i, ]
+    
+    # convert sibling ids
+    if (!is.na(passengerSelect$SiblingId)){
+        passengerSelect$SiblingId <- list(as.numeric(unlist(strsplit(passengerSelect$SiblingId[[1]], ";"))))
+    } else {
+        passengerSelect$SiblingId <- NA
+    }
+    # convert children ids
+    if (!is.na(passengerSelect$ChildrenId)){
+        passengerSelect$ChildrenId <- list(as.numeric(unlist(strsplit(passengerSelect$ChildrenId[[1]], ";"))))
+    } else {
+        passengerSelect$ChildrenId <- NA
+    }
+    # convert parents ids
+    if (!is.na(passengerSelect$ParentsId)){
+        passengerSelect$ParentsId <- list(as.numeric(unlist(strsplit(passengerSelect$ParentsId[[1]], ";"))))
+    } else {
+        passengerSelect$ParentsId <- NA
+    } 
+    
+    passenger[i, ] <- passengerSelect
+}
+
+# convert class faeture to categorical
+passenger$Pclass <- as.factor(passenger$Pclass)
+```
+
+Next I check all features which have missing values.
+
+```{r}
+# get number of features
+nFeature <- dim(passenger)[2]
+nPassenger <- dim(passenger)[1]
+# names of features
+featureName <- names(passenger)
+
+for (i in 1:nFeature){
+    # get number of missing values
+    if (class(passenger[, i]) %in% c("factor", "character")){
+        nMissing <- sum(passenger[, i] == "")
+    } else {
+        nMissing <- sum(is.na(passenger[, i]))  
+    } 
+    
+    # check if feature has missing values
+    if (nMissing > 0) {
+        print(paste(featureName[i], ": ", nMissing, "/", nPassenger, " missing values", sep = ""))
+    }
+}
+```
+
+Since the passenger data set consists of training and test data, the "Survived" feature has missing values. "SpouseId", "SiblingId", "ParentsId", and "ChildrenId" have missing values if the resepctive passenger did not have any of these relatives aboard. All "SurvivedDiff" features have missing values if the survival of the relative is unknown (the relative is in the test data set). All passengers without a husband have no value for "HusbandFirstname" of course.
+
+Next, I will check for several features whether the values are plausible and impute missing and unplausible values. First I will start with the ticket feature. 
+
+# Ticket
+
+It could be helpful to know which passengers had the same ticket. This information could be used to estimate the age of these passengers as well as finding further correlations among the survival rate of passengers with the same ticket. 
+
+```{r}
+passenger$SameTicketId <- list(NA)
+passenger$SameTicketNumber <- 0
+
+# get ids of passengers with the same ticket
+for (i in 1:nPassenger){
+    # find passengers with the same ticket
+    sameTicketId <- passenger$PassengerId[passenger$Ticket == passenger$Ticket[i]]
+    
+    # number of passengers with the same ticket
+    passenger$SameTicketNumber[i] <- length(sameTicketId)
+    
+    # add passenger ids with same ticket
+    if (passenger$SameTicketNumber[i] > 1){
+        passenger$SameTicketId[[i]] <- sameTicketId[sameTicketId != passenger$PassengerId[i]]
+    }
+}
+
+# get number of passengers per ticket
+nTicketPassenger <- passenger$SameTicketNumber[!duplicated(passenger$Ticket)]
+
+ggplot(data = data.frame(nTicketPassenger), aes(nTicketPassenger)) + geom_histogram(bins = 11)
+table(nTicketPassenger)
+```
+
+Unfortunatly, there are a lot of passengers with unique tickets. Hence, it will not be possible to extract a lot of information from this feature. Let's check how the number of passengers differs from the number of family members.
+
+```{r}
+# create family size feature
+passenger$FamilySize = passenger$SibSp + passenger$Parch + 1
+
+ggplot(data = passenger, aes(SameTicketNumber - FamilySize)) + geom_histogram(binwidth = 1)
+table(passenger$SameTicketNumber - passenger$FamilySize)
+```
+
+It seems that most passengers without any family member on board had unique tickets and most passengers within a family used the same ticket. 
+
+# Fare
+
+First I check if there is a correlation between the fare and the number of passengers with the same ticket:
+
+```{r, warning = FALSE}
+ggplot(passenger, aes(x = SameTicketNumber, y = Fare)) +
+    geom_point(shape=1) +    
+    geom_smooth(method=lm) 
+```
+
+It looks like the fare feature is the price of the ticket which could be used by several passenger and not the price every individual had to pay. Therefore, I create another feature which contains the fare per person.
+
+```{r}
+passenger$FarePerPerson <- passenger$Fare / passenger$SameTicketNumber
+```
+
+Let's check how this feature correlates with the number of passengers having the same ticket:
+
+```{r, warning = FALSE}
+ggplot(passenger, aes(x = SameTicketNumber, y = FarePerPerson)) +
+    geom_point(shape=1) +    
+    geom_smooth(method=lm) 
+```
+
+This looks much better, there is still a small increase with respect to the number of people having the same ticket, but it's much lower than at the previous fit. 
+
+There is exactly one passenger with a missing fare value:
+
+```{r}
+iPassenger <- is.na(passenger$Fare)
+kable_styling(kable(passenger[iPassenger, c("Name", "Pclass", "Age", "Ticket", "SameTicketNumber", "SibSp", "Parch")], "html"), full_width = F)
+```
+
+As Mr. Storey traveled alone I can't derive the price of his ticket from any other passenger. Hence, I impute the median price of third class ticket for one passenger, which is 7.75.
+
+```{r}
+passenger$Fare[iPassenger] <- 
+    median(passenger$FarePerPerson[passenger$Pclass == 3 & passenger$SameTicketNumber == 1], na.rm = TRUE)
+passenger$FarePerPerson[iPassenger] <- passenger$Fare[iPassenger]
+```
+
+# Embarked
+
+There are two passengers with no embarkment information:
+
+```{r, results = 'asis'}
+passengerNoEm <- passenger[passenger$Embarked == "", ]
+
+kable(passengerNoEm[, c("PassengerId", "Name", "Pclass", "SibSp", "Parch", "Ticket", "SameTicketNumber")], caption = "Passenger no embarkment", "html") %>% kable_styling(full_width = F)
+
+```
+
+Both were first class passengers without any relatives aboard. Furthermore, no one else had the same ticket as they had. 
+Their embarkment could be imputed with respect to their class or their ticket. Let's check if there is a correlation between the passenger's embarkment and class. 
+
+```{r, warning = FALSE}
+# get all passengers with embarkment information
+passengerSelect <- passenger[!passenger$Embarked == "", ]
+
+# group passengers by class
+passengerGroup <- group_by(passengerSelect, Pclass)
+# get number of passengers in the same class
+passengerClass <- summarise(passengerGroup, Number = length(Pclass))
+
+# group passengers by class and embarkment
+passengerGroup <- group_by(passengerSelect, Pclass, Embarked)
+# get number of passengers in the same class
+passengerClassEm <- summarise(passengerGroup, Number = length(Pclass))
+
+passengerClassEm$Share <- NA
+
+# calculate embarkment share with respect to classes
+for (iClass in 1:3){
+    iSelect <- passengerClassEm$Pclass == iClass
+    passengerClassEm$Share[iSelect] <- passengerClassEm$Number[iSelect] / passengerClass$Number[iClass]
+}
+
+ggplot(passengerClassEm, aes(x = Embarked, y = Share, fill = Pclass)) + 
+    geom_bar(stat = "identity", position = position_dodge())
+
+```
+
+Almost no 1st class passengers embarked at "Q". So the two passengers without embarkment information most likely embarked either at "C" or "S". 
+
+Let's have a look if passengers who embarked at the same place have similar tickets. 
+
+```{r}
+# number of sampled tickets
+nSample <- 30
+
+# get 1st class passengers only
+passengerSelect <- passenger[passenger$Pclass == 1 & !is.na(passenger$Ticket), ]
+
+for(i in c("C", "Q", "S")){
+    print(paste("Embarked = ", i))
+    iSelect <- passengerSelect$Embarked == i
+    print(sample(passengerSelect$Ticket[iSelect], min(nSample, sum(iSelect))))
+}
+```
+Regarding the ticket names it is not 100% clear where the two passengers embarked. However, the tickets of passengers who embarked at "C" have much more often the letters "PC" in the ticket name. Therefore, I assume that the two passengers embarked at "S". 
+"S" stands for Southampton in Briton and "C" for Cherbourg in France. Since the names of the two passengers sound british it makes more sense that they embarked in "S".
+
+```{r}
+# set embarkment to "S"
+passenger$Embarked[passenger$Embarked == ""] <- "S"
+```
+
+# Age
+
+Age has 263 missing values. First of all I check whether there is a difference in the survival rate of passengers with and without age value.
+
+```{r}
+
+passenger$HasAge <- !is.na(passenger$Age)
+
+passengerGroup <- group_by(passenger, HasAge)
+passengerSurvival <- summarize(passengerGroup, count = n(), survivalRate = mean(Survived, na.rm = T))
+
+kable(passengerSurvival, "html") %>% kable_styling(full_width = F)
+
+ggplot(passengerSurvival, aes(x = HasAge, y = survivalRate)) + 
+    geom_bar(stat = "identity", position = position_dodge())
+
+```
+
+There is a difference of more than 10% in the survival rate. Hence, "HasAge" could be useful as well to predict the passengers' survival. 
+
+To check if the existing values are plausible I plot a histogram with all age values.
+
+```{r, warning = FALSE}
+# plot age distribution
+ggplot(data = passenger, aes(Age)) + geom_histogram(bins = 80)
+summary(passenger$Age)
+```
+
+Looks ok, there are no negative values and no unreasonable high values. Next, I check if the age values of passengers matches the age of its relatives, e.g. parents must be older than their children etc. Therefore, I define the following ranges:
+
+* parents must be at least 14 years older than their children
+* siblings must not have an age difference higher than 20 years
+* maried passengers must be at least 15 years old
+
+I add the minimum, average, and maximum age of all passengers with family members to get some more features for the missing value imputation. 
+
+```{r}
+# update age of spouse
+updateSpouseAge <- function(passenger){
+    passenger$SpouseAge <- NA
+    indexPassenger <- which(passenger$SpouseNumber == 1)
+    for (i in indexPassenger) {
+        passenger$SpouseAge[i] <- passenger$Age[passenger$PassengerId == passenger$SpouseId[i]]
+    }
+    return(passenger)    
+}
+
+# update age of siblings
+updateSiblingAge <- function(pasenger){
+    passenger$SiblingAgeMin <- NA
+    passenger$SiblingAgeMax <- NA
+    passenger$SiblingAgeMean <- NA
+    indexPassenger <- which(passenger$SiblingNumber > 0)
+    for (i in indexPassenger){
+        siblingAge <- passenger$Age[passenger$PassengerId %in% passenger$SiblingId[[i]]]
+        # check that there is at least one value not NA
+        if (any(!is.na(siblingAge))){
+            passenger$SiblingAgeMin[i] <- min(siblingAge, na.rm = TRUE)
+            passenger$SiblingAgeMax[i] <- max(siblingAge, na.rm = TRUE)
+            passenger$SiblingAgeMean[i] <- mean(siblingAge, na.rm = TRUE)
+        }
+    }
+    return(passenger)    
+}
+
+# update age of parents
+updateParentAge <- function(passenger){
+    passenger$ParentAgeMin <- NA
+    passenger$ParentAgeMax <- NA
+    passenger$ParentAgeMean <- NA
+    indexPassenger <- which(passenger$ParentsNumber > 0)
+    for (i in indexPassenger){
+        parentAge <- passenger$Age[passenger$PassengerId %in% passenger$ParentsId[[i]]]
+        if (any(!is.na(parentAge))){
+            passenger$ParentAgeMin[i] <- min(parentAge, na.rm = TRUE)
+            passenger$ParentAgeMax[i] <- max(parentAge, na.rm = TRUE)
+            passenger$ParentAgeMean[i] <- mean(parentAge, na.rm = TRUE)    
+        }
+    }
+    return(passenger)    
+}
+
+# update age of children
+updateChildrenAge <- function(passenger){
+    passenger$ChildrenAgeMin <- NA
+    passenger$ChildrenAgeMax <- NA
+    passenger$ChildrenAgeMean <- NA
+    indexPassenger <- which(passenger$ChildrenNumber > 0)
+    for (i in indexPassenger){
+        childrenAge <- passenger$Age[passenger$PassengerId %in% passenger$ChildrenId[[i]]]
+        if (any(!is.na(childrenAge))){
+            passenger$ChildrenAgeMin[i] <- min(childrenAge, na.rm = TRUE)
+            passenger$ChildrenAgeMax[i] <- max(childrenAge, na.rm = TRUE)
+            passenger$ChildrenAgeMean[i] <- mean(childrenAge, na.rm = TRUE)    
+        }
+    }
+    return(passenger)    
+}
+
+# update age of passengers with same ticket
+updateSameTicketAge <- function(passenger){
+    passenger$SameTicketAgeMin <- NA
+    passenger$SameTicketAgeMax <- NA
+    passenger$SameTicketAgeMean <- NA
+    indexPassenger <- which(passenger$SameTicketNumber > 1)
+    for (i in indexPassenger){
+        sameTicketAge <- 
+            passenger$Age[passenger$PassengerId %in% passenger$SameTicketId[[i]]]
+        if (any(!is.na(sameTicketAge))){
+            passenger$SameTicketAgeMin[i] <- min(sameTicketAge, na.rm = TRUE)
+            passenger$SameTicketAgeMax[i] <- max(sameTicketAge, na.rm = TRUE)
+            passenger$SameTicketAgeMean[i] <- mean(sameTicketAge, na.rm = TRUE)    
+        }
+    }
+    return(passenger)
+}
+
+# update age of all relatives
+updateAllAge <- function(passenger){
+    # execute all age update functions    
+    passenger <- updateSiblingAge(passenger)
+    passenger <- updateParentAge(passenger)
+    passenger <- updateChildrenAge(passenger)
+    passenger <- updateSameTicketAge(passenger)
+    passenger <- updateSpouseAge(passenger)        
+    return(passenger)
+}
+
+# execute update
+passenger <- updateAllAge(passenger)
+```
+
+```{r, results = 'asis'}
+
+# this function checks if the passengers' age is plausible
+isAgePlausible <- function(passengerCheck, passengerAll){
+    # parameter
+    # min age of married passengers [y]
+    minAgeMarried <- 15
+    # max age difference to siblings [y]
+    maxDiffSibling <- 20
+    # min age difference to children [y]
+    minDiffChild <- 14
+    #maximum passenger age
+    maxAge <- 100
+    
+    # get number of passengers
+    nPassenger <- nrow(passengerCheck)
+    
+    # initialise output vector
+    isPlausible <- rep(FALSE, nPassenger)
+
+    # check age requirements for each passenger
+    for (i in 1:nPassenger){
+        passengerSelect <- passengerCheck[i, ]
+        
+        # check if passenger has an age values
+        if (is.na(passengerSelect$Age)) {
+            # go to next passenger
+            next
+        }
+        
+        if (passengerSelect$Age < 0) {
+            next
+        }
+        if (passengerSelect$Age > maxAge) {
+            next
+        }
+        
+        # check if passenger is married
+        if (passengerSelect$SpouseNumber == 1){
+            if (passengerSelect$Age < minAgeMarried){
+                next
+            }
+        }
+        
+        # check if passenger has siblings
+        if (passengerSelect$SiblingNumber > 0){
+            # get siblings
+            sibling <- passengerAll[passengerAll$PassingerId %in% passengerSelect$SiblingId, ]
+            
+            # get sibling age values
+            siblingAge <- sibling$Age[!is.na(sibling$Age)]
+            
+            # check that at least one siblings has a non NA age value
+            if (length(siblingAge > 0)){
+            
+                # calculate highest age difference to siblings
+                ageDiff <- max(abs(passengerSelect$Age - siblingAge))
+                
+                # check if age difference is too high
+                if (ageDiff > maxDiffSibling){
+                    next
+                }
+            }
+        }
+        
+        # check if passenger has children
+        if (passengerSelect$ChildrenNumber > 0){
+            # get children
+            children <- passengerAll[passengerAll$PassengerId %in% unlist(passengerSelect$ChildrenId), ]
+            
+            # get children age
+            childrenAge <- children$Age[!is.na(children$Age)]
+            
+            # check that at least one child has a non NA age value
+            if (length(childrenAge > 0)){
+            
+                # calculate age difference to children
+                ageDiff <- min(passengerSelect$Age - childrenAge)
+                
+                # check if age difference is too low
+                if (ageDiff < minDiffChild){
+                    next
+                }
+            }
+        }
+        
+        # check if passenger has paraents
+        if (passengerSelect$ParentsNumber > 0){
+            # get parents
+            parents <- passengerAll[passengerAll$PassengerId %in% unlist(passengerSelect$ParentsId), ]
+            
+            # get parents age
+            parentsAge <- parents$Age[!is.na(parents$Age)]
+            
+            # check that at least one parent has an non NA age
+            if (length(parentsAge > 0)){
+            
+                # calculate age difference to parents
+                ageDiff <- min(parentsAge - passengerSelect$Age)
+                
+                # check if age difference is too low
+                if (ageDiff < minDiffChild){
+                    next
+                }
+            }
+        }
+        # no condition was violated - age is plausible
+        isPlausible[i] <- TRUE
+    }
+    return(isPlausible)
+}
+
+# evaluate plausibility
+isPlausible <- isAgePlausible(passenger, passenger)
+```
+
+Let's have a look at the passengers with no plausible age:
+
+```{r}
+kable_styling(kable(passenger[!isPlausible & !is.na(passenger$Age), c("PassengerId", "Name", "Age", "SpouseAge", "SiblingAgeMin", "SiblingAgeMax", "ParentAgeMin", "ChildrenAgeMax")], "html") 
+, full_width = F)
+```
+
+There are in total seven passengers with no plausible age: 
+
+* Adele Nasser (ID 10) is married and only 14 years old, 
+* William Ford (ID 87) is younger than at least one of his children, 
+* Robina Ford (ID 148) is only seven years younger than her father, 
+* Doolina Ford (ID 437) is older than her father, 
+* Rossmore Abbot (ID 747) is only three years older than his child, 
+* Edward Ford (ID 1059) is older than his father, 
+* Eugene Abbot (ID 1284) is only three years younger than his father. 
+
+It seems that the age of Adele Nasser, William Ford, and Rossmore Abbot is wrong, so I set the age of these passengers to NA:
+
+```{r}
+passenger$Age[c(10, 87, 747)] <- NA
+# update age of all passengers
+passenger <- updateAllAge(passenger)
+# check if age of passengers is plausible
+isPlausible <- isAgePlausible(passenger, passenger)
+
+```
+
+Number of passengers with age value which is not plausible:
+
+```{r}
+
+# get number of passengers with age value which is not plausible
+sum(!isPlausible & !is.na(passenger$Age))
+
+```
+The age of all other passengers is plausible. 
+
+Now there are 266 age values missing in total. Let's see how the number of missing values is distributed between passengers with and without family on board.
+
+```{r}
+withFamily <- passenger$Parch > 0 | passenger$SibSp > 0
+# number of passengers with missing age and family members aboard
+missingWithFamily <- sum(is.na(passenger$Age) & withFamily)
+# number of passengers with missing age and no family members but other people with the same ticket aboard
+missingNoFamilySameTicket <- sum(is.na(passenger$Age) & !withFamily & passenger$SameTicketNumber > 1)
+# number of passenger with missing age and no family members and no other people with the same ticket aboard
+missingNoFamilyNoSameTicket <- sum(is.na(passenger$Age) & !withFamily & passenger$SameTicketNumber == 1)
+
+missingAge <- data.frame(
+    type = c("With Familiy", "No Familiy same Ticket", "No Family no same Ticket"), 
+    count = c(missingWithFamily, missingNoFamilySameTicket, missingNoFamilyNoSameTicket))
+
+kable(missingAge, "html") %>% kable_styling(full_width = F)
+
+ggplot(missingAge, aes(x = type, y = count)) + geom_bar(stat = "identity", position = position_dodge())
+```
+
+There are 69 passengers with missing age values but family members aboard. Among the remaining passengers without age there are 22 who shared their ticket with someone else and the majority of 175 passengers didn't have any family members aboard and also didn't share their ticket with someone else.
+
+Next I create a subset of the passenger data set which contains only the features I will use for the age impuation.
+
+```{r}
+# names of features used for age imputation
+ageImputeFeature <- c("Age", "Pclass", "Sex", "Title", "SpouseNumber", "SiblingNumber", "ChildrenNumber", "ParentsNumber", "SameTicketNumber", "FarePerPerson", "SiblingAgeMin", "SiblingAgeMax", "SiblingAgeMean", "ParentAgeMin", "ParentAgeMax", "ParentAgeMean", "ChildrenAgeMin", "ChildrenAgeMax", "ChildrenAgeMean", "SameTicketAgeMin", "SameTicketAgeMax", "SameTicketAgeMean", "SpouseAge")
+imputeSet <- passenger[, ageImputeFeature]
+# number of features
+nFeature <- length(ageImputeFeature)
+```
+
+Next, I use "mice" to impute missing age values. Thereby, I'm generating several impution values for each passenger and use the plausibility check to decide which value shall be finally assigned to each passenger. 
+
+```{r, message = FALSE}
+# set seed
+set.seed(0)
+# get age of all passengers before imputing to compare distributions before and after imputing
+ageBefore <- passenger$Age[!is.na(passenger$Age)]
+
+# name of imputation method
+imputeMethod <- "pmm"
+# number of imputations per passenger
+nImpute <- 10
+
+# apply mice to impute age
+miceRes <- mice(imputeSet, m = nImpute, method = imputeMethod, printFlag = FALSE)
+imputeValue <- miceRes$imp$Age
+
+# get all passengers for which age values were generated
+passengerAgeImput <- passenger[is.na(passenger$Age), ]
+# number of imputations
+nPas <- nrow(passengerAgeImput)
+
+for (iPassenger in 1:nPas){
+    # select passenger 
+    passengerSelect <- passengerAgeImput[iPassenger, ]
+    
+    # insert imputed values once the first plausible value was found
+    for (iImpute in 1:nImpute){
+        # insert impute value
+        passengerSelect$Age <- imputeValue[iPassenger, iImpute]
+        # check if imputation is plausible
+        isPlausible <- isAgePlausible(passengerSelect, passenger)
+        if (isPlausible){
+            # plausible value found
+            # insert value to passenger set
+            passenger$Age[passenger$PassengerId == passengerSelect$PassengerId] <- passengerSelect$Age
+            # update passenger age
+            passenger <- updateAllAge(passenger)
+            break
+        }
+    }
+    
+    # check if one plausible value was found
+    if (!isPlausible){
+        sprintf("Warning: no plausbile value found for passenger Id %d", passengerSelect$PassengerId)
+    }
+}
+```
+
+Number of passengers with none-plausible age:
+
+```
+# check if age of all passengers is plausible
+isPlausible <- isAgePlausible(passenger, passenger)
+sum(!isPlausible)
+```
+
+Now the age of all passengers is plausible. Let's compare the age distribution before and after imputing:
+
+```{r}
+# combine age values to data frames
+ageOrg <- data.frame(age = ageBefore, name = "original")
+ageImp <- data.frame(age = passenger$Age, name = "imputed")
+ageAll <- rbind(ageOrg, ageImp)
+
+ggplot(ageAll, aes(age, fill = name)) + 
+    geom_histogram(alpha = 0.5, aes(y = ..density..), position = 'identity', bins = 80)
+
+```
+
+The distributions look very similar, so the imputed values cannot be completely wrong. 
+
+# Cabin
+
+Cabin is the feature with the most missing values.
+
+```{r}
+# number of passengers with no cabin information
+sum(passenger$Cabin == "")
+```
+
+In total 1014 out of 1309 values are missing. 
+First, I check whether passengers with this feature had different survival rates than others.
+
+```{r}
+survivalRateWithCabin <- mean(passenger$Survived[passenger$Cabin != "" & !is.na(passenger$Survived)])
+survivalRateWithoutCabin <- mean(passenger$Survived[passenger$Cabin == "" & !is.na(passenger$Survived)])
+
+passengerCabin <- data.frame(HasCabin = c(FALSE, TRUE), 
+                             SurvivalRate = c(survivalRateWithoutCabin, survivalRateWithCabin))
+
+kable(passengerCabin, "html") %>% kable_styling(full_width = F)
+
+ggplot(passengerCabin, aes(x = HasCabin, y = SurvivalRate)) + geom_bar(stat = "identity", position = "dodge")
+
+```
+
+There is a very clear difference. One reason could be that the cabin was mainly recorded for first class passengers whoes survival rates were higher. Let's see how this faeture is distributed among the classes:
+
+```{r}
+# get what passenger has cabin value
+hasCabin <- passenger$Cabin != ""
+
+# calculate share for each class
+share1 <- mean(hasCabin[passenger$Pclass == 1])
+share2 <- mean(hasCabin[passenger$Pclass == 2])
+share3 <- mean(hasCabin[passenger$Pclass == 3])
+
+cabinShare <- data.frame(Pclass = c(1, 2, 3), Share = c(share1, share2, share3))
+
+kable_styling(kable(cabinShare, "html"), full_width = F)
+ggplot(cabinShare, aes(x = Pclass, y = Share)) + geom_bar(stat = "identity", position = "dodge")
+```
+
+Almost only 1. class passengers had this feature, which explains the big difference in the survival rates. Nevertheless, I add the hasCabin feature to the data set.
+
+```{r}
+passenger$HasCabin <- FALSE
+passenger$HasCabin[passenger$Cabin != ""] <- TRUE
+```
+
+Let's compare the survival probability of passengers with respect to the passengers class and cabin feature. 
+
+```{r}
+passengerClass <- group_by(passenger, Pclass, HasCabin)
+cabinSurvival <- summarize(passengerClass, Count = n(), Survival = mean(Survived, na.rm = T))
+
+kable_styling(kable(cabinSurvival, "html"), full_width = F)
+
+ggplot(cabinSurvival, aes(x = Pclass, y = Survival, group = HasCabin, fill = HasCabin)) + 
+    geom_bar(stat = "identity", position = "dodge")
+```
+
+Even by taking the classes into account, there is still a significant difference in the survival rates of passengers with and without this feature. Hence, HasCabin should be very helpful to predict the survival of passengers. 
+
+Due to the huge number of missing values its very difficult to impute all missing values. First of all, I check if I can impute values for passengers with the same ticket. 
+
+Number of passengers with no cabin information:
+
+```{r}
+# get all passengers with no cabin value and at least one other passenger with the same ticket
+passengerNoCabin <- passenger[!passenger$HasCabin, ]
+
+for (iPassenger in 1:nrow(passengerNoCabin)){
+    # get Cabin of all passengers with the same ticket
+    cabinSameTicket <- passenger$Cabin[passenger$PassengerId %in% 
+                                           unlist(passengerNoCabin$SameTicketId[iPassenger])]
+    
+    # get index of entry with cabin
+    indexCabin <- which(cabinSameTicket != "")
+    
+    # check if any other cabin could be found
+    if (length(indexCabin) > 0){
+        # insert cabin feature to passenger
+        iPassenger <- passenger$PassengerId == passengerNoCabin$PassengerId[iPassenger]
+        passenger$Cabin[iPassenger] <- cabinSameTicket[indexCabin[1]]
+        passenger$HasCabin[iPassenger] <- TRUE
+        
+    }
+}
+
+# number of passengers with no cabin information
+sum(!passenger$HasCabin)
+```
+
+So there were 15 passengers for which a cabin value could be imputed. 
+The first letter of the cabin feature describes the deck of the cabin while the number is the cabin number. I split these two pieces of information.
+
+```{r}
+# create deck and cabin number features
+passenger$Deck <- str_extract(passenger$Cabin, "[A-Z]+" )
+passenger$Deck[!passenger$HasCabin] <- ""
+passenger$CabinNr <- as.numeric(str_extract(passenger$Cabin, "[0-9]+" ))
+```
+
+Let's see how the survival rates were for each deck:
+
+```{r}
+passengerDeck <- group_by(passenger, Deck)
+deckSurvival <- summarize(passengerDeck, count = n(), survival = mean(Survived, na.rm = T))
+
+kable(deckSurvival, "html") %>% kable_styling(full_width = F)
+ggplot(deckSurvival, aes(x = Deck, y = survival)) + geom_bar(stat = "identity", position = "dodge")
+
+```
+
+There is a significant difference in the survival rate for each deck. Let's have a look at how many people of each class stayed on each deck:
+
+```{r}
+passengerClass <- group_by(passenger, Deck, Pclass)
+deckInfoBefore <- summarize(passengerClass, 
+                            count = n(), 
+                            meanFarePP = round(mean(FarePerPerson), 1), 
+                            meanFare = round(mean(Fare), 1), 
+                            meanSameTicket = round(mean(SameTicketNumber), 1), 
+                            meanAge = round(mean(Age), 1), 
+                            meanSibSp = round(mean(SibSp), 1), 
+                            meanParch = round(mean(Parch), 1))
+
+kable_styling(kable(deckInfoBefore, "html"), full_width = F)
+
+ggplot(deckInfoBefore, aes(x = Deck, y = count, fill = Pclass, group = Pclass)) + 
+    geom_bar(stat = "identity", position = "dodge") + 
+    ggtitle("Number of passengers per deck")
+
+ggplot(deckInfoBefore, aes(x = Deck, y = meanFarePP, fill = Pclass, group = Pclass)) + 
+    geom_bar(stat = "identity", position = "dodge") + 
+    ggtitle("Mean fare per passenger and deck")
+
+ggplot(deckInfoBefore, aes(x = Deck, y = meanSameTicket, fill = Pclass, group = Pclass)) + 
+    geom_bar(stat = "identity", position = "dodge") + 
+    ggtitle("Mean number of passengers with same ticket per deck")
+```
+
+There are quite some differences for each deck even within the same classes. Regarding first class, deck B was obviously the most expensive one (per person) where assumingly mainly families stayed, deck C was a little bit cheaper than B. Deck A was cheaper and consisted mainly of single passengers whereby deck D had about the same size and contained primarely couples or small families. Deck E was even a bit cheaper and had more families than D. 
+Regarding second class, deck D was most expensive and exclusively consisted of single passengers. Deck E and F mainly differ with respect to the number of passengers with the same number of tickets. 
+Concerning third class, first of all it is notable that the number of people with cabin information is much smaller than for the upper classes. Hence, it is expectable that statistical fluctuations are higher. However, despite the little data it can be seen that there are clear differences regarding the number of people sharing the same ticket: Deck F had the smallest number while deck G had the highest. 
+There was one person on deck T. That looks very strange. I remove the cabin information of that person. 
+
+```{r}
+iRemove <- passenger$Deck == "T"
+passenger$Cabin[iRemove] <- ""
+passenger$Deck[iRemove] <- ""
+passenger$CabinNr[iRemove] <- NA
+```
+
+Next, I apply mice to impute all missing deck values. In order to make sure that passengers are only assinged to decks of their class, I impute this feature for each class seperately. 
+
+```{r}
+# set missing values to NA
+passenger$Deck[passenger$Deck == ""] <- NA
+
+# names of features used for deck imputation
+deckImputeFeature <- c("Deck", "Pclass", "Sex", "Title", "SpouseNumber", "SiblingNumber", "ChildrenNumber", "ParentsNumber", "SameTicketNumber", "FarePerPerson", "Age")
+#deckImputeFeature <- c("Deck", "Pclass")
+imputeSet <- passenger[, deckImputeFeature]
+imputeSet$Deck <- as.factor(imputeSet$Deck)
+
+# name of imputation method
+imputeMethod <- "pmm"
+# number of imputations per passenger
+nImpute <- 1
+
+for (iClass in 1:3){
+    iSelect <- passenger$Pclass == iClass
+    # apply mice to impute deck
+    miceRes <- mice(imputeSet[iSelect, ], 
+                    m = nImpute, 
+                    method = imputeMethod, 
+                    printFlag = FALSE)
+    imputeValue <- as.character(unlist(miceRes$imp$Deck))    
+
+    iImpute <- iSelect & is.na(passenger$Deck)
+    passenger$Deck[iImpute] <- imputeValue
+}
+
+```
+
+The imputing algorithm did not take care that passengers with the same ticket stayed in the same cabin and therefore must have been on the same deck. Thus, I check this condition for all passengers. For all passengers where this condition is not fulfilled I impute the most frequent deck value among the passengers with the same ticket. 
+
+```{r}
+# get all tickets of passengers who shared their tickte
+allTicket <- unique(passenger$Ticket[passenger$SameTicketNumber > 1])
+
+for (ticket in allTicket){
+    # get passengers with same ticket
+    iPassenger <- passenger$Ticket == ticket
+    # create table with deck values
+    deckTable <- table(passenger$Deck[iPassenger])
+    # check if all passengers have the same value
+    if (nrow(deckTable) == 1){next}
+    # randomly permute table 
+    # (this is necessary as the table values are always alphabetically ordered 
+    # which would result in selecting deck values at the beginning of the 
+    # alphabet too frequently)
+    deckTable <- sample(deckTable, nrow(deckTable))
+    # get most frequent deck of these passengers
+    deckMost <- names(which.max(deckTable)) 
+    # assign this deck to all passengers
+    passenger$Deck[iPassenger] <- deckMost
+}
+```
+
+Let's have a look at the results:
+
+```{r}
+passengerClass <- group_by(passenger, Deck, Pclass)
+deckInfoAfter <- summarize(passengerClass, 
+                           count = n(), 
+                           meanFarePP = round(mean(FarePerPerson), 1), 
+                           meanFare = round(mean(Fare), 1), 
+                           meanSameTicket = round(mean(SameTicketNumber), 1), 
+                           meanAge = round(mean(Age), 1), 
+                           meanSibSp = round(mean(SibSp), 1), 
+                           meanParch = round(mean(Parch), 1))
+
+kable_styling(kable(deckInfoAfter, "html"), full_width = F)
+
+deckInfoDiff <- cbind(Deck = deckInfoAfter$Deck, 
+                      Pclass = deckInfoAfter$Pclass, 
+                      (deckInfoAfter[, 3:9] - deckInfoBefore[4:14, 3:9]))
+
+kable_styling(kable(deckInfoDiff, "html", full_width = F))
+
+ggplot(deckInfoAfter, aes(x = Deck, y = count, fill = Pclass, group = Pclass)) + 
+    geom_bar(stat = "identity", position = position_dodge()) + 
+    ggtitle("Number of passengers per deck")
+
+ggplot(deckInfoAfter, aes(x = Deck, y = meanFarePP, fill = Pclass, group = Pclass)) + 
+    geom_bar(stat = "identity", position = position_dodge()) + 
+    ggtitle("Mean fare per passenger and deck")
+
+ggplot(deckInfoAfter, aes(x = Deck, y = meanSameTicket, fill = Pclass, group = Pclass)) + 
+    geom_bar(stat = "identity", position = position_dodge()) + 
+    ggtitle("Mean number of passengers with same ticket per deck")
+
+```
+
+In general the differences between before and after the imputing are moderate. Some major differences occured for the number of people with the same ticket at deck D and G. However, due to the very high number of missing values these differendes should be acceptable. 
+
+Next, I want to check if there is a difference in even and odd cabin numbers regarding the survival of passengers. According to https://www.kaggle.com/oysteijo/titanic-passenger-survival cabins with odd numbers were on the ship's starboard side while even cabin number were on the port side.
+
+```{r}
+# create new feature for cabin side
+evenNr <- passenger$CabinNr %% 2 == 0
+cabinSide <- rep('Unknown', nPassenger)
+cabinSide[evenNr] <- 'Starboard'
+cabinSide[!evenNr] <- 'Port'
+passenger$CabinSide <- as.factor(cabinSide)
+
+passengerGroup <- group_by(passenger, CabinSide)
+sideGroup <- summarize(passengerGroup, 
+                       count = n(), 
+                       survival = mean(Survived, na.rm = T), 
+                       meanFarePP = mean(FarePerPerson), 
+                       meanSameTicket = mean(SameTicketNumber), 
+                       meanAge = mean(Age), meanSibSp = mean(SibSp), 
+                       meanParch = mean(Parch))
+
+kable_styling(kable(sideGroup, "html"), full_width = F)
+
+ggplot(sideGroup, aes(x = CabinSide, y = survival)) + geom_bar(stat = "identity", position = position_dodge())
+
+```
+
+There is a difference of 11% between port and starboard side. The reason for this could be that while the ship was sinking it turned to one side and lifeboats at one side could not be released anymore. Thus, this feature could help to predict the survival more accurately. However, the main problem here is that for most of the passengers this information is not available. 
+The other features deviate between the two sides only slightly. I guess this is because the design of the ship was symmetrical so that there were not differences between cabin on the starboard or port side. Thus, I will not impute any values to this feature and keep it as it is. 
+
+Finally, I want to check if there is a difference in the survival with respect to the cabin Nr. I assume that besides starboard of port, the cabin number may also include some information whether the cabin was located at the front or the back of the ship. As the ship sank with the front, passengers at the back may had better survival chances. 
+
+```{r, warning = FALSE}
+ggplot(passenger, aes(x = CabinNr, y = Survived)) +
+    geom_point(shape=1) +    
+    geom_smooth(method=lm) 
+```
+
+There is a decrease with the cabin number. However, it must be taken into account that certainly third class passengers had smaller cabin which in turn means that there were more cabins on the same deck so that the cabin number of these passengers must have been higher on average than that of first class passengers. In order to take that into account I dintinguish between the classes.
+
+```{r, warning = FALSE}
+ggplot(passenger, aes(x = CabinNr, y = Survived, colour = as.factor(Pclass))) +
+    geom_point(shape=1) +    
+    geom_smooth(method=lm) 
+
+```
+
+Here we can see that the survival rate of third class passengers increased with the cabin number while for first and second class passengers it decreased. All three lines have a very high uncertainty region, hence it is difficult to say if the cabin number really had an effect on the survival or not. Furthmore, keeping in mind that this feature has a lot of missing values which are very difficult to impute I will not further work on this feature. 
+
+# Conclusion
+
+With this kernel I created a dataset with 57 features. Not all features can be used for the survival prediction like the passengers' names. Furthermore, certainly a number of features are highly correlated like "Fare" and "FarePerPerson". In order to avoid overfitting it should be carefully assesed which of these features shall be used for the prediction.
+I think the most interesting question is how to use the survival information of relatives to predict the survival of passengers. I haven't found any kernel yet which addressed that question. Any suggestions with this regard are most welcome. The output of this kernel is the passenger dataset, anyone who wants to use this dataset for further analysis is welcome to do so. 
+Furthmore, I would be glad to get any feedback on this kernel. 
+
+```{r}
+# create output file
+passengerOutput <- passenger
+
+# replace empty integers by NA
+passengerOutput$SpouseId[sapply(passenger$SpouseId, length) == 0] <- NA
+passengerOutput$SiblingId[sapply(passenger$SiblingId, length) == 0] <- NA
+passengerOutput$ChildrenId[sapply(passenger$ChildrenId, length) == 0] <- NA
+passengerOutput$ParentsId[sapply(passenger$ParentsId, length) == 0] <- NA
+passengerOutput$SameTicketId[passenger$SameTicketNumber == 1] <- NA
+
+# replace lists by comma separated strings
+for (i in 1:dim(passengerOutput)[1]){
+    if (passengerOutput$SiblingNumber[i] > 1){
+        passengerOutput$SiblingId[i] <- paste(as.character(passengerOutput$SiblingId[[i]]), collapse = ";") 
+    }
+    if (passengerOutput$ChildrenNumber[i] > 1){
+        passengerOutput$ChildrenId[i] <- paste(as.character(passengerOutput$ChildrenId[[i]]), collapse = ";")
+    }
+    if (passengerOutput$ParentsNumber[i] > 1){
+        passengerOutput$ParentsId[i] <- paste(as.character(passengerOutput$ParentsId[[i]]), collapse = ";")
+    }
+    if (passengerOutput$SameTicketNumber[i] > 2){
+        passengerOutput$SameTicketId[i] <- paste(as.character(passengerOutput$SameTicketId[[i]]), collapse = ";")
+    }    
+}
+
+# convert lists to characters
+passengerOutput$SpouseId <- as.character(passengerOutput$SpouseId)
+passengerOutput$SiblingId <- as.character(passengerOutput$SiblingId)
+passengerOutput$ChildrenId <- as.character(passengerOutput$ChildrenId)
+passengerOutput$ParentsId <- as.character(passengerOutput$ParentsId)
+passengerOutput$SameTicketId <- as.character(passengerOutput$SameTicketId)
+
+# order by passenger id
+passengerOutput <- passengerOutput[order(passengerOutput$PassengerId), ]
+
+# save passenger data set
+write.csv(passengerOutput, file = "passenger.csv")
+```

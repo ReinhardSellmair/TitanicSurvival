@@ -1,0 +1,1505 @@
+---
+title: "Save the Families!"
+author: "Reinhard Sellmair"
+date: "11 December 2016"
+output: 
+    html_document:
+        toc: true
+        number_sections: true
+---
+
+# Summary
+
+With this script I introduce a method to link passengers based on their family relations - I try to find the passenger ids of each passengers spouses, siblings, parents, and children. In order to do so I took almost each feature of the Titanic data set into account.
+The algorithms I introduce are able to link the majority of all passengers with their family members correctly.
+
+All remaining links were done "by hand", whereby I provide detailed explanations why I made additional links or removed links. The code for these combinations is provided as well, so that the construction of the final data set with all family relations is reproducible. 
+
+When developing all these methods I realised that the original data set seems to contain some flawed feature values which I partly corrected as well in this script. 
+
+After reconstructing the family relations I check for correlation between the survival of family members which I found in almost every case. One of the most impressive result I found out is, that all wifes whose husband survived survived as well and vise versa all husbands whose wifes did not survive didn't survive as well.
+
+The reconstructed family relations can be used to impute missing values more precisely and to make more accurate predictions about the passengers' survival. 
+
+# Introduction
+
+I'm wondering whether it is possible to reconstruct families based on the data set. With reconstructing I mean to assign to each passenger the passenger ids of its family members (spouse, siblings, parents, and children), providing that these family members were on board of course. Having this information could be very helpful:
+
+* to estimate missing age values more accurately
+* to impute missing cabin number
+
+Furthermore, there is a strong correlation between the survival of family members. These relations can be used to predict the survival of passengers more accurately. The original data set contains a lot of information which can help to reconstruct families: e.g. surname, title, age, ticket, cabin number, number of parents + children, number of siblings + spouse. So I will use all that information to rebuild families as good as possible.
+
+The structure of the reminder of this script is as follows: First I will do some data pre-processing and build more features. Afterwards I will explain how to link spouses, siblings, parents, and children. After each linking I will analyse correlations of the survival rate among these groups. Finally I will conclude this script.
+
+# Pre-processing data
+
+Read data files:
+```{r}
+testData <- read.csv("../input/test.csv")
+trainingData <- read.csv("../input/train.csv")
+```
+
+Combine training and test data.
+```{r}
+# include "Survived" column in test data set
+testData$Survived <- rep(NA, times = dim(testData)[1])
+  
+# add information of which data set data origins
+testData$DataSet <- as.factor(rep("Test", times = dim(testData)[1]))
+trainingData$DataSet <- as.factor(rep("Training", times = dim(trainingData)[1]))
+
+# combine data sets
+passenger <- rbind(trainingData, testData)
+```
+
+Let's have a look at the data
+```{r}
+str(passenger)
+```
+
+As Megan found out already, using the passengers' title is very helpful:
+```{r}
+# convert names to characters
+passenger$Name <- as.character(passenger$Name)
+
+# extract title from name
+passenger$Title <- gsub('(.*, )|(\\..*)', '', passenger$Name)
+
+# Titles with very low cell counts to be combined to "rare" level
+rare_title <- c('Dona', 'Lady', 'the Countess','Capt', 'Col', 'Don', 
+                'Major', 'Sir', 'Jonkheer')
+
+# Also reassign mlle, ms, and mme accordingly
+passenger$Title[passenger$Title == 'Mlle']        <- 'Miss' 
+passenger$Title[passenger$Title == 'Ms']          <- 'Miss'
+passenger$Title[passenger$Title == 'Mme']         <- 'Mrs' 
+passenger$Title[passenger$Title %in% rare_title]  <- 'RareTitle'
+
+# convert title to factor
+passenger$Title <- as.factor(passenger$Title)
+
+# Show title counts by sex again
+table(passenger$Sex, passenger$Title)
+```
+
+
+Next, I create some additional features. First of all, the passengers' surname is of course of up most importance to find families.
+```{r}
+passenger$Surname <- gsub(",.*$", "", passenger$Name)
+```
+
+Now I extract the passengers' first name. Usually the first name is the part of the name behind the title. However, in case of Mrs the first name is the leading part of the name in brackets and in case of passengers with the title Miss there could be a nickname in "" which I will remove. Furthermore, I create another feature called "MaidenName". This feature might help to identify siblings and I add another feature containing the husband's first name of married women.
+
+```{r}
+# create MaidenName feature
+passenger$MaidenName <- passenger$Surname
+
+# get passengers' first names
+passenger$Firstname <- replicate(dim(passenger)[1], "")
+# get husband's first name
+passenger$HusbandFirstname <- replicate(dim(passenger)[1], "")
+
+# get indexes of all passengers with title Mrs
+# there are some Mrs who do not have names in brackets, these shall be treated as not Mrs
+iMrs <- passenger$Title == "Mrs" & sapply(passenger$Name, function(x) length(grep("\\(", x)) > 0)
+
+# extract first names of all passengers execept Mrs
+passenger$Firstname[!iMrs] <- gsub("(.*\\. )|( \\(.*)|( \\\".*)", "", passenger$Name[!iMrs])
+
+# get full maiden name of married women
+fullName <- gsub("(.*\\()|(\\).*)", "", passenger$Name[iMrs])
+# extract first name and surname from maiden name
+passenger$Firstname[iMrs] <- gsub(" [^ ]*$", "", fullName)
+passenger$MaidenName[iMrs] <- gsub(".* ", "", fullName)
+# extract husbands first name
+passenger$HusbandFirstname[iMrs] <- gsub("(.*\\. )|( \\(.*)|(\\(.*)", "", passenger$Name[iMrs])
+
+# there are two special cases for passengers with RareTitle left which I correct by hand
+passenger$MaidenName[557] <- "Sutherland"
+passenger$Firstname[557] <- "Lucille Christiana"
+
+passenger$MaidenName[760] <- "Dyer-Edwards"
+passenger$Firstname[760] <- "Lucy Noel Martha"
+
+library(knitr)
+kable(head(passenger[, c("Name", "Title", "Surname", "MaidenName", "Firstname", "HusbandFirstname")], 20))
+```
+
+The result looks good, I couldn't find any errors. 
+
+# Spouses
+
+Spouses seem to be easier to combine than siblings since I can use the additional information of the husbands first name.
+ 
+## Combining
+
+First, I create features indicating the number of spouses aboard and the spouse' passenger id, then I filter all passengers without any family members on board.
+
+```{r}
+# add two more columns
+# number of spouses (0 or 1)
+passenger$SpouseNumber <- replicate(dim(passenger)[1], 0)
+# id of spouse
+passenger$SpouseId <- list(NA)
+
+# these are all passengers without families
+iNoFamily <- passenger$Parch == 0 & passenger$SibSp == 0
+noFamily <- passenger[iNoFamily,]
+# these are all passengers with families
+family <- passenger[!iNoFamily,]
+```
+Next, I want to find the passengers' spouses. Therefore, I only need passengers with:
+
+* at least one sibling/spouse
+* title: Dr, Mr, Mrs, RareTitle 
+
+```{r}
+# this data set contains all passngers which could have their spouse on board 
+iSpouse <- family$SibSp >= 1 & family$Title %in% c("Dr", "Mr", "Mrs", "Rev", "RareTitle")
+spouse <- family[iSpouse, ]
+noSpouse <- family[!iSpouse, ]
+```
+
+Finally, I split this data set into one with men and one with women only.
+
+```{r}
+husband <- subset(spouse, Sex == "male")
+wife <- subset(spouse, Sex == "female")
+```
+
+Let's see how many potential husbands and wifes we have.
+```{r}
+dim(husband)[1]
+dim(wife)[1]
+```
+
+Now I combine husbands with wifes. First, I check for common surnames and classes (should have been quite unlikely that spouses traveled in different classes). If there is no match I assume that this passenger doesn't have his/her spouse on board.
+
+```{r}
+for (iWife in (1:dim(wife)[1])){
+    # get husbands with same surname and class
+    indexHusband <- which(husband$Pclass == wife$Pclass[iWife] & husband$Surname == wife$Surname[iWife])
+    # number of potential husbands
+    nHusband <- length(indexHusband)
+    
+    # check if husband could be found
+    if (nHusband == 0){
+        # no husband could be found - go to next woman
+        next
+    }
+    
+    # add potential husbands to wife
+    wife$SpouseNumber[iWife] <- length(indexHusband)
+    wife$SpouseId[[iWife]] <- husband$PassengerId[indexHusband]
+    
+    # add wife to husbands
+    for (iHusband in indexHusband){
+        husband$SpouseNumber[iHusband] <- husband$SpouseNumber[iHusband] + 1
+        # create new SpouseId
+        SpouseIdNew <- c(husband$SpouseId[[iHusband]], wife$PassengerId[iWife])
+        # remove NAs
+        SpouseIdNew <- SpouseIdNew[!is.na(SpouseIdNew)]
+        # assign new spouse id vector
+        husband$SpouseId[[iHusband]] <- SpouseIdNew
+    }
+}
+```
+
+Let's see how many spouses I found:
+```{r}
+spouse <- rbind(husband, wife)
+# sort spouse by surname
+spouse <- spouse[order(spouse$Surname), ]
+tapply(spouse$Name, spouse$SpouseNumber, length)
+```
+
+Ok, there are 58 passengers without any match, 222 with one, and 8 with more than one match. 
+
+Let's have a look at passengers with more than one match first:
+```{r, results = 'asis'}
+# get all passengers with more than one spouse and the spouses they are linked to.
+indexMoreSpouse <- which(spouse$SpouseNumber > 1)
+for (iSpouse in indexMoreSpouse){
+    print(kable(spouse[iSpouse, c("Name", "Age", "Pclass", "Sex", "Title", "Ticket", "SibSp", "Parch", "Cabin", "Fare")]))
+    print(kable(spouse[spouse$PassengerId %in% spouse$SpouseId[[iSpouse]], c("Name", "Age", "Pclass", "Sex", "Title", "Ticket", "SibSp", "Parch", "Cabin", "Fare")]))
+}
+```
+
+For these passengers I decide first to which one the really fit. Therefore, I check the following criteria:
+
+1. match of husbands first name
+2. same cabin
+3. same ticket
+4. same fare
+5. same SibSp and Parch
+
+I will match the couple which fulfills the earliest numbered criteria. If there is no match at all I assume that the passenger is not married.
+
+```{r}
+# match passengers with more than one spouses
+for (iSpouse in indexMoreSpouse){
+    # check if passenger still has more than one candidate (due to previous iterations candidates may have been dismissed)
+    if (spouse$SpouseNumber[iSpouse] < 2){
+        # go to next candidate
+        next
+    }
+    # get candidates who might be married with the selected passenger
+    indexCandidate <- which(spouse$PassengerId %in% spouse$SpouseId[[iSpouse]])
+    candidate <- spouse[indexCandidate, ]
+    
+    # matching candidates
+    iCandidateMatch <- replicate(dim(candidate)[1], TRUE)
+    
+    # check if first names are matching
+    firstNameMatch <- candidate$Firstname == spouse$HusbandFirstname[iSpouse] | candidate$HusbandFirstname == spouse$Firstname[iSpouse]
+    # replace NAs by FALSE
+    firstNameMatch[is.na(firstNameMatch)] <- FALSE
+    
+    # check if any candidates matched
+    if (any(firstNameMatch)){
+        # update indexes of candidates
+        iCandidateMatch <- iCandidateMatch & firstNameMatch
+    }
+
+    # check more than one candidate is left
+    if (sum(iCandidateMatch) > 1) {
+        # check if cabine matches
+        cabinMatch <- candidate$Cabin != "" & candidate$Cabin == spouse$Cabin[iSpouse]
+        # check any candidates would be left after applying this criteria
+        if(any(iCandidateMatch[cabinMatch])){
+            # update candidates
+            iCandidateMatch <- iCandidateMatch & cabinMatch
+        }
+    }
+
+    # check more than one candidate is left
+    if (sum(iCandidateMatch) > 1) {
+        # check if ticket matches
+        ticketMatch <- candidate$Ticket == spouse$Ticket[iSpouse]
+        # check any candidates would be left after applying this criteria
+        if(any(iCandidateMatch[ticketMatch])){
+            # update candidates
+            iCandidateMatch <- iCandidateMatch & ticketMatch
+        }
+    }    
+    
+    # check more than one candidate is left
+    if (sum(iCandidateMatch) > 1) {
+        # check if fare matches
+        fareMatch <- candidate$Fare == spouse$Fare[iSpouse]
+        # check any candidates would be left after applying this criteria
+        if(any(iCandidateMatch[fareMatch])){
+            # update candidates
+            iCandidateMatch <- iCandidateMatch & fareMatch
+        }
+    }    
+    
+    # check more than one candidate is left
+    if (sum(iCandidateMatch) > 1) {
+        # check if family size matches (SibSp and Parch)
+        familyMatch <- candidate$SibSp == spouse$SibSp[iSpouse] & candidate$Parch == spouse$Parch[iSpouse]
+        # check any candidates would be left after applying this criteria
+        if(any(iCandidateMatch[familyMatch])){
+            # update candidates
+            iCandidateMatch <- iCandidateMatch & familyMatch
+        }
+    }  
+    
+    # check if there are more than one candidate left
+    if (sum(iCandidateMatch) > 1){
+        print("Still more than one possible fit left")
+    }
+    
+    # remove all candidates which did not match
+    for (iCandidate in indexCandidate[!iCandidateMatch]){
+        # reduce number of spouses
+        spouse$SpouseNumber[iCandidate] <- spouse$SpouseNumber[iCandidate] - 1
+        spouse$SpouseId[[iCandidate]] <- spouse$SpouseId[[iCandidate]][spouse$SpouseId[[iCandidate]] != spouse$PassengerId[iSpouse]]
+    }
+    
+    # check if any candidate was found
+    if (sum(iCandidateMatch) == 1){
+        # match selected spouse with candidate
+        spouse$SpouseNumber[iSpouse] <- 1
+        spouse$SpouseId[[iSpouse]] <- spouse$PassengerId[indexCandidate[iCandidateMatch]]
+        spouse$SpouseNumber[indexCandidate[iCandidateMatch]] <- 1
+        spouse$SpouseId[[indexCandidate[iCandidateMatch]]] <- spouse$PassengerId[iSpouse]
+    } else if (sum(iCandidateMatch) == 0){
+        # no match could be found
+        spouse$SpouseNumber[iSpouse] <- 0
+        spouse$SpouseId[[iSpouse]] <- NA
+    } else {
+        sprintf("Criteria for passenger Id %d not sufficient - more than one candidate was left.", spouse$PassengerId[iSpouse])
+    }
+}    
+```
+
+Let's have a look again at the number of spouses.
+```{r}
+tapply(spouse$Name, spouse$SpouseNumber, length)
+```
+
+Now there are no passengers left with more than one potential spouse. Finally, I check if the passengers with one potential spouse are married, therefore I use the same criteria as before and check if at least one of them is fulfilled. If this is true I assume that the couple is married otherwise I assume they are not married.
+
+```{r}
+# get indexes of all female passengers with one spouse
+indexWife <- which(spouse$Sex == "female" & spouse$SpouseNumber == 1)
+for (iWife in indexWife){
+    # get wife and husband
+    wifeSelect <- spouse[iWife, ]
+    iHusband <- which(spouse$PassengerId == wifeSelect$SpouseId)
+    husbandSelect <- spouse[iHusband, ]
+    
+    # apply criteria
+    firstNameMatch <- husbandSelect$Firstname == wifeSelect$HusbandFirstname
+    # for some wifes the husband's first name couldn't be found
+    if (is.na(firstNameMatch)) {firstNameMatch <- FALSE}
+    cabinMatch <- husbandSelect$Cabin != "" & husbandSelect$Cabin == wifeSelect$Cabin
+    ticketMatch <- husbandSelect$Ticket == wifeSelect$Ticket
+    fareMatch <- husbandSelect$Fare == wifeSelect$Fare
+    familyMatch <- husbandSelect$SibSp == wifeSelect$SibSp & husbandSelect$Parch == wifeSelect$Parch
+    
+    # decide if couple is married
+    if (!any(c(firstNameMatch, cabinMatch, ticketMatch, fareMatch, familyMatch))) {
+        # no criteria is fulfilled - couple is not married
+        # remove links
+        spouse$SpouseNumber[iWife] <- 0
+        spouse$SpouseId[iWife] <- NA
+        spouse$SpouseNumber[iHusband] <- 0
+        spouse$SpouseId[iHusband] <- NA
+    }
+}
+
+# update spouse and noSpouse data sets
+noSpouse <- rbind(noSpouse, spouse[spouse$SpouseNumber == 0, ])
+spouse <- subset(spouse, SpouseNumber == 1)
+# order by name
+noSpouse <- noSpouse[order(noSpouse$Name),]
+spouse <- spouse[order(spouse$Name),]
+
+# rebuild family set
+family <- rbind(spouse, noSpouse)
+
+# rebuild passenger set
+passenger <- rbind(family, noFamily)
+# order by surname
+passenger <- passenger[order(passenger$Surname),]
+```
+
+Let's have a look at some "unusual" couples:
+
+```{r}
+kable(passenger[passenger$Surname == "Abbott" | passenger$MaidenName == "Hunt", c("PassengerId", "Name", "Age", "Cabin", "Ticket", "SibSp", "Parch", "SpouseId")])
+```
+
+Rosa Abbott was 35 and had 1 SibSp and 1 Parch and had the same ticket as Rossmore Edward Abbott (16) who also had 1 SibSp and 1 Parch and Eugene Joseph Abbott (13) who has 0 SibSp and 2 Parch. It seems very obvious that Rosa and Rossmore are married and Eugene is their child. However, Rossmore is only 3 years older than Eugene - there must be something wrong. In order to make sure that Rosa didn't have a sibling on board I also looked for Hunt as maiden name, but Georg Henry Hunt didn't have any siblings on board. So at least one of the shown information must be wrong. 
+
+Let's have a look at Margret and William Ford:
+```{r}
+kable(passenger[passenger$Surname == "Ford" | passenger$MaidenName == "Watson", c("PassengerId", "Name", "Age", "Cabin", "Ticket", "SibSp", "Parch", "SpouseId")])
+```
+
+Arthur Ford and Ennis Watson didn't have any family on board so they are not related to our couple. Elizabeth Watson has 1 SbSp and I found her husband too, so I don't think that she was Margret's sister. So there are Doolina, Robina and Edward left. They all had the same ticket and 2 SibSp, 2 Parch and the same ticket, so I strongly believe that they were siblings and since they also had the same ticket as Margret and William they must have been the children of our couple. Furthermore, Margret and William had 3 Parch, which underlines this theory. However, when we look again at the age, we see that William is even five years younger than Doolina! Again something is wrong.
+
+I want to add that for both of these couples the wifes' husband name (extracted from the wifes' Name feature) is not the same as the first name of the passenger they were matched to. However, since the others features of the passengers fitted very well I assume that the information of the Name feature regarding the husband's first name is also not 100% reliable. Another example of a first name mismatch is the Skoog couple:
+
+```{r}
+kable(passenger[passenger$Surname == "Skoog", c("PassengerId", "Name", "Age", "Cabin", "Ticket", "SibSp", "Parch", "SpouseId")])
+```
+
+I think it is obvious that Anna Skoog is married with Wilhelm Skoog although the husband's first name is William and not Wilhelm.
+
+Let's come back to the Abbott and Ford families. Since all features except the age are fitting very well, I suspect that there is some bias in the age feature. 
+
+Last but not least, I found some passengers whose SibSp number was 0 but who seemed to be married too:
+
+```{r}
+kable(passenger[passenger$Surname %in% c("Risien", "Ware"), c("PassengerId", "Name", "Age", "Sex", "SpouseNumber", "SibSp", "Parch", "Pclass", "Ticket", "Fare", "Cabin")])
+```
+
+It looks very obvious that Emma and Samuel Risien were married since the husband first name, the ticket, and the fare matches, however they were not matched since both have SibSp = 0. Also Florence and John Ware must have been married since first name, ticket and fare are matching too. 
+
+I match these couples by hand an correct the SibSp values.
+
+```{r}
+# Samuel Risien
+iPassenger <- which(passenger$PassengerId == 539)
+passenger$SibSp[iPassenger] <- passenger$SibSp[iPassenger] + 1
+passenger$SpouseNumber[iPassenger] <- 1
+passenger$SpouseId[[iPassenger]] <- 1274
+
+# Emma Risien
+iPassenger <- which(passenger$PassengerId == 1274)
+passenger$SibSp[iPassenger] <- passenger$SibSp[iPassenger] + 1
+passenger$SpouseNumber[iPassenger] <- 1
+passenger$SpouseId[[iPassenger]] <- 539
+
+# John Ware
+iPassenger <- which(passenger$PassengerId == 1170)
+passenger$SibSp[iPassenger] <- passenger$SibSp[iPassenger] + 1
+passenger$SpouseNumber[iPassenger] <- 1
+passenger$SpouseId[[iPassenger]] <- 1254
+
+# Florence Ware
+iPassenger <- which(passenger$PassengerId == 1254)
+passenger$SibSp[iPassenger] <- passenger$SibSp[iPassenger] + 1
+passenger$SpouseNumber[iPassenger] <- 1
+passenger$SpouseId[[iPassenger]] <- 1170
+```
+
+
+## Survival Analysis
+
+After matching couples I will analyse in this section whether there are some patterns regarding the survival of spouses. First, let's see if passengers with their spouse on board were more likely to survive:
+
+```{r}
+
+
+# survival rate of married passengers
+marriedSurvived <- mean(passenger$Survived[passenger$SpouseNumber == 1], na.rm = TRUE)
+
+# survival rate of unmarried passengers
+unmarriedSurvived <- mean(passenger$Survived[passenger$SpouseNumber == 0], na.rm = TRUE)
+
+# survival rate of passengers with spouses or siblings
+sibSpSurvived <- mean(passenger$Survived[passenger$SibSp > 0], na.rm = TRUE)
+
+# survival rate of passengers with no spouses or siblings
+noSibSpSurvived <- mean(passenger$Survived[passenger$SibSp == 0], na.rm = TRUE)
+
+plotData <- data.frame(name = c("Spouse", "No Spouse", "SibSp > 0", "SibSp = 0"), survivalRate = c(marriedSurvived, unmarriedSurvived, sibSpSurvived, noSibSpSurvived))
+plotData$name <- factor(plotData$name, levels = plotData$name)
+
+library(ggplot2)
+
+ggplot(plotData, aes(x = name, y = survivalRate)) + geom_bar(stat = "identity", fill = "blue")
+
+```
+
+51.3% of all passengers with their spouse on board survived whereas only 35.9% of the passengers without spouse survived, that's a difference of 16.3%. Having had a spouse improved the chance to survive significantly. Furthermore, we can see that the SpouseNumber feature is a stronger indicator than the SibSp feature as the difference between passengers with SibSp > 0 to passengers with SibSp = 0 is only 11.9%.
+
+Now I check if there is a correlation of the survival of couples - if one spouse survived is the other spouse more likely to survive? Therefore, I first introduce a new feature "SpouseSurvivedDiff" which contains the information if the passenger's spouse survived. If the passengers' spouse survived it is one, if its spouse did not survive it is -1 and if the passenger did not have a spouse it is 0. Furthermore, if the survival of the spouse is unknown (spouse is in test data set) the value is NA. 
+I compare the survival rates of all passengers with respect to sex with the survival rates of married passengers with respect to sex and the survival of the husband.
+
+```{r}
+passenger$SpouseSurvivedDiff <- 0
+indexSpouse <- which(passenger$SpouseNumber == 1)
+for (iSpouse in indexSpouse) {
+    spouseSurvived <- passenger$Survived[passenger$PassengerId == passenger$SpouseId[iSpouse]]
+    passenger$SpouseSurvivedDiff[iSpouse] <- 2 * spouseSurvived - 1
+}
+
+# get survival rates of passengers with respect to sex
+plotData <- data.frame(Sex = factor(c("female", "male")), Name = factor("All", "All"), Survival = tapply(passenger$Survived, passenger$Sex, mean, na.rm = TRUE))
+
+# get survival rates of married passengers with respect to sex and survival of spouse
+temp <- tapply(passenger$Survived, list(passenger$Sex, passenger$SpouseSurvivedDiff), mean, na.rm = TRUE)
+plotData <- rbind(plotData, data.frame(Sex = factor(c("female", "male")), Name = factor("Spouse Died", "Spouse Died"), Survival = temp[, 1]), data.frame(Sex = factor(c("female", "male")), Name = factor("No Spouse", "No Spouse"), Survival = temp[, 2]), data.frame(Sex = factor(c("female", "male")), Name = factor("Spouse Survived", "Spouse Survived"), Survival = temp[, 3]))
+
+ggplot(plotData, aes(x = Name, y = Survival, fill = Sex)) + geom_bar(stat = "identity", position = position_dodge())
+```
+
+Wow that's very clear: all female whose husband survived survived too and all men whose wife didn't survive didn't survive as well. The survival rate of married women whose husband didn't survive is almost the same as the survival rate of all female passengers, whereas the survival rate of men whose wifes survived is 12.7% higher than the survival rate of male passengers in general. The survival rate of unmarried passengers is almost the same as the survival rate over all passengers since the number of married passengers is only 220 compared to the total number of passengers which is 1309.
+
+Next, I seperate this plot with respect to the passengers classes. 
+
+```{r, warning=FALSE}
+# survival of spouses for different classes
+library(gridExtra)
+
+# survival of all passengers
+tempAll <- tapply(passenger$Survived, list(passenger$Sex, passenger$Pclass), mean, na.rm = TRUE)
+# survival of passengers with respect to survival of spouse
+tempSpouse <- tapply(passenger$Survived, list(passenger$Sex, passenger$Pclass, passenger$SpouseSurvivedDiff), mean, na.rm = TRUE)
+
+# convert to data frames
+survivalAll <- data.frame(Pclass = as.factor(rep(c(1, 2, 3), 2)), 
+                          Sex = as.factor(c(rep("female", 3), rep("male", 3))), 
+                          Survival = matrix(aperm(tempAll), ncol = 1))
+survivalNoSpouse <- data.frame(Pclass = as.factor(rep(c(1, 2, 3), 2)), 
+                               Sex = as.factor(c(rep("female", 3), rep("male", 3))), 
+                               Survival = matrix(aperm(tempSpouse[, , 2]), ncol = 1))
+survivalSpouseDie <- data.frame(Pclass = as.factor(rep(c(1, 2, 3), 2)), 
+                                Sex = as.factor(c(rep("female", 3), rep("male", 3))), 
+                                Survival = matrix(aperm(tempSpouse[, , 1]), ncol = 1))
+survivalSpouseSurvive <- data.frame(Pclass = as.factor(rep(c(1, 2, 3), 2)), 
+                                    Sex = as.factor(c(rep("female", 3), rep("male", 3))), 
+                                    Survival = matrix(aperm(tempSpouse[, , 3]), ncol = 1))
+
+p1 <- ggplot(survivalAll, aes(x = Pclass, y = Survival, fill = Sex)) + geom_bar(stat = "identity", position = position_dodge()) + 
+    ggtitle("All passengers")
+
+p2 <- ggplot(survivalNoSpouse, aes(x = Pclass, y = Survival, fill = Sex)) + geom_bar(stat = "identity", position = position_dodge()) + 
+    ggtitle("Passenger without spouse")
+
+p3 <- ggplot(survivalSpouseSurvive, aes(x = Pclass, y = Survival, fill = Sex)) + geom_bar(stat = "identity", position = position_dodge()) + 
+    ggtitle("Passenger with spouse survived")
+
+p4 <- ggplot(survivalSpouseDie, aes(x = Pclass, y = Survival, fill = Sex)) + geom_bar(stat = "identity", position = position_dodge()) + 
+    ggtitle("Passenger with spouse died")
+             
+grid.arrange(p1, p2, p3, p4, nrow = 2, ncol = 2)
+
+```
+
+The upper left plot shows the survival rate of all passengers regardless whether they had spouses or not, the upper right shows the survival of all passengers who didn't have spouses, while the lower left and right plots show survival rates of passengers whos spouses survived or died. There are two missing values: there were no male passengers in first class whos wife did not survive and no female passengers in third class whoes husband survive. For these cases no bars are shown. 
+Since most passengers did not have spouses, the upper plots look very similar. While the lower plots show that there is again a very strong correlation between the survival of the passenger and the survival of its spouse for each passenger class.  
+
+# Siblings
+
+Now I want to find out which passengers are siblings. First I will combine passengers who I believe are siblings and next I will have a look at the survival of siblings.
+
+## Combining
+
+Since I know already which passengers are spouses I can calculate the number of siblings very easily:
+
+```{r}
+# create feature with number of siblings
+passenger$SiblingNumber <- passenger$SibSp - passenger$SpouseNumber
+# create feature with passenger ids of siblings
+passenger$SiblingId <- list(NA)
+
+# split data set between passengers with and without siblings
+sibling <- passenger[passenger$SiblingNumber > 0, ]
+noSibling <- passenger[passenger$SiblingNumber == 0, ]
+
+# order siblings by original name
+sibling <- sibling[order(sibling$MaidenName), ]
+```
+
+First, I search for sibling candidates. Therefore, I use the following conditions:
+
+- same Original Name
+- same number of siblings
+
+```{r}
+# create feature number of matched sibling
+sibling$SiblingNumberMatch <- 0
+
+# find sibling candidates
+for (iSibling in 1:dim(sibling)[1]){
+    siblingSelect <- sibling[iSibling, ]
+    
+    # get passenger ids of potential siblings
+    siblingMatch <- sibling[sibling$MaidenName == siblingSelect$MaidenName & sibling$SiblingNumber == siblingSelect$SiblingNumber & sibling$PassengerId != siblingSelect$PassengerId, ]
+    
+    # number of matches
+    siblingSelect$SiblingNumberMatch <- dim(siblingMatch)[1]
+    # insert sibling ids
+    siblingSelect$SiblingId <- list(siblingMatch$PassengerId)
+    
+    # reinsert selected sibling into sibling set
+    sibling[iSibling, ] <- siblingSelect
+}
+```
+
+Let's check for how many siblings the correct number of siblings was matched by subtracting the number of siblings from the number of matched siblings:
+
+```{r}
+tapply(sibling$Name, sibling$SiblingNumberMatch - sibling$SiblingNumber, length)
+```
+
+189 sibling were matched with the correct number of siblings, 16 siblings were matched with too few passengers and 7 siblings with too many passengers.
+Let's have a look at all passengers who were matched to too many siblings
+
+```{r}
+kable(sibling[(sibling$SiblingNumberMatch - sibling$SiblingNumber) > 0, c("PassengerId", "SiblingId", "MaidenName", "Name", "Age", "SiblingNumber", "SiblingNumberMatch", "SibSp", "Parch", "Ticket", "Fare", "Cabin")])
+```
+
+Regarding the Anderssons it looks that Sigvard, Ebba, Ellis, Ingeborg, and Sigrid are siblings since they all had the same ticket. Which means that Ida and Erna belonged to a different family. Due to the age difference and the fact that they had different tickets and fares it doesn't look like they were siblings. For the other two Anderssons I couldn't find any fitting siblings at all so I suspect that their SibSp feature is wrong.
+
+```{r}
+# create function to update siblings
+updateSibling <- function(dataSet, siblingId){
+    nSibling <- length(siblingId)
+    iSibling <- which(dataSet$PassengerId %in% siblingId)
+    for (i in 1:nSibling){
+        dataSet$SiblingId[[iSibling[i]]] <- siblingId[siblingId != siblingId[i]]
+    }  
+    dataSet
+}
+
+# passenger ids of Anderssons who are siblings
+sibling <- updateSibling(sibling, c(851, 814, 120, 542, 543))
+
+# passenger ids of Anderssons who are no siblings
+AnderssonNoSiblingId <- c(69, 1106)
+iAnderssonNoSibling <- sibling$PassengerId %in% AnderssonNoSiblingId
+sibling$SiblingId[iAnderssonNoSibling] <- NA
+sibling$SiblingNumberMatch[iAnderssonNoSibling] <- 0
+sibling$SiblingNumber[iAnderssonNoSibling] <- 0
+sibling$SibSp[iAnderssonNoSibling] <- 0
+```
+
+These are the passengers with too few siblings matched:
+
+```{r}
+kable(sibling[(sibling$SiblingNumberMatch - sibling$SiblingNumber) < 0, c("PassengerId", "SiblingId", "MaidenName", "Name", "Age", "SiblingNumber", "SiblingNumberMatch", "SibSp", "Parch", "Ticket", "Fare", "Cabin")])
+```
+
+Among these there are some siblings which were not matched because of double names:
+
+- Anderssen-Jensen & Jensen siblings
+- Kink & Kink-Heilmann siblings
+
+I match these now:
+```{r}
+# match Anderssen-Jensen with Jensen
+sibling <- updateSibling(sibling, c(193, 722))
+
+# match Kink with Kink-Heilmann
+sibling <- updateSibling(sibling, c(1268, 70, 1286))
+```
+
+I believe that John Davies and Joseph Nicholls were siblings too since they had the same ticket and the same Parch number. Their different surnames age difference of 11 years is an indication that their mother married twice and that they are half-brothers.
+
+```{r}
+# match Davies with Nicholls
+sibling <- updateSibling(sibling, c(550, 146))
+```
+
+Among the remaining siblings I found some matches in the noSibling data set. In order to combine them I merge the sibling and noSibling data sets.
+
+```{r}
+# drop SiblingNumberMatch from sibling data set
+sibling <- sibling[, !(names(sibling) == "SiblingNumberMatch")]
+
+# rebuild passenger data set, remove sibling
+passenger <- rbind(sibling, noSibling)
+passenger <- passenger[order(passenger$Surname), ]
+
+# select passengers which might be siblings
+kable(passenger[passenger$PassengerId %in% c(1076, 119, 84, 1295, 693, 827), c("PassengerId", "SiblingId", "MaidenName", "Name", "Age", "SiblingNumber", "SibSp", "Parch", "Ticket", "Fare", "Cabin")])
+```
+
+I assume that Quigg Baxter and Mary Douglas, Francisco and Jose Carrau, Ali and Len Lam are siblings since they all have the same tickets and fares. Finally I correct the SibSp and SiblingNumber of those passengers for whom I couldn't find matching siblings.
+
+```{r}
+# match siblings
+passenger <- updateSibling(passenger, c(119, 1076))
+passenger <- updateSibling(passenger, c(84, 1295))
+passenger <- updateSibling(passenger, c(693, 827))
+
+# correct sibSp and SiblingNumber of passengers from noSibling data set
+iPassenger <- passenger$PassengerId %in% c(84, 1295, 693, 827, 119)
+passenger$SibSp[iPassenger] <- 1
+passenger$SiblingNumber[iPassenger] <- 1
+
+# correct SibSp and SbilingNumber of passengers with no matching siblings (they all have SibSp = 1)
+iPassenger <- passenger$PassengerId %in% c(756, 1130, 41, 443, 996, 1025)
+passenger$SibSp[iPassenger] <- 0
+passenger$SiblingNumber[iPassenger] <- 0
+```
+
+## Survival Anaysis
+
+Now I have a look at the survival of siblings. In order to analyse the chance of passengers with siblings aboard I include another feature "SiblingSurvivedDiff" which is difference of number of survived siblings and number of not survived siblings. If the survival of any sibling is unknown the value is set to NA.
+
+```{r}
+# initialise feature
+passenger$SiblingSurvivedDiff <- 0
+# get indexes of all passengers with siblings aboard
+indexSibling <- which(passenger$SiblingNumber > 0)
+# get survival rate of siblings
+for (iPassenger in indexSibling){
+    # get survival values of siblings
+    SiblingSurvived <- passenger$Survived[passenger$PassengerId %in% passenger$SiblingId[[iPassenger]]]
+    
+    # difference of survived and not survived siblings
+    passenger$SiblingSurvivedDiff[iPassenger] <- sum(SiblingSurvived == 1) - sum(SiblingSurvived == 0)
+}
+
+# replace NaN by NA
+passenger$SiblingSurvivedDiff[is.na(passenger$SiblingSurvived)] <- NA
+```
+
+Let's have a look on the passengers' survival rates with respect to their siblings:
+
+```{r}
+survivalRate <- replicate(8, 1, NA)
+
+# survival rate of passengers with spouse and siblings
+iSelect <- passenger$SpouseNumber == 1 & passenger$SiblingNumber > 0
+survivalRate[1:2] <- tapply(passenger$Survived[iSelect], passenger$Sex[iSelect], mean, na.rm = TRUE)
+# survival rate of passengers with spouse but no siblings
+iSelect <- passenger$SpouseNumber == 1 & passenger$SiblingNumber == 0
+survivalRate[3:4] <- tapply(passenger$Survived[iSelect], passenger$Sex[iSelect], mean, na.rm = TRUE)
+# survival rate of passengers with no spouse but siblings
+iSelect <- passenger$SpouseNumber == 0 & passenger$SiblingNumber > 0
+survivalRate[5:6] <- tapply(passenger$Survived[iSelect], passenger$Sex[iSelect], mean, na.rm = TRUE)
+# survival rate of passengers with no spouse and no siblings
+iSelect <- passenger$SpouseNumber == 0 & passenger$SiblingNumber == 0
+survivalRate[7:8] <- tapply(passenger$Survived[iSelect], passenger$Sex[iSelect], mean, na.rm = TRUE)
+
+# create data frame
+plotData <- data.frame(Sex = factor(c("female", "male")), Name = c("Spouse Sibling", "Spouse Sibling", "Spouse no Sibling", "Spouse no Sibling", "no Spouse Sibling", "no Spouse Sibling", "no Spouse no Sibling", "no Spouse no Sibling"), SurvivalRate = survivalRate)
+plotData$Name <- factor(plotData$Name, levels = plotData$Name[seq(1, 7, 2)])
+
+ggplot(plotData, aes(x = Name, y = SurvivalRate, fill = Sex)) + geom_bar(stat = "identity", position = position_dodge())
+```
+
+We can see that passengers with spouse and siblings aboard had the best survival chances. All female passengers with spouse and siblings survived, however there were only three passengers in total who fulfilled that requirement. Interestingly, the survival rate of females with no spouse but siblings is lower than the survival rate of females with no spouse and no siblings. In contrast the survival rate of men without spouse and siblings is the lowest.
+
+Next, I have a look if the passenger's survival rate depends on the number of siblings.
+
+```{r}
+# survival rate with respect to number of siblings
+survivalRate <- tapply(passenger$Survived, list(passenger$Sex, passenger$SiblingNumber), mean, na.rm = TRUE)
+plotData <- data.frame(Sex = factor(c("female", "male")), SiblingNumber = sort(rep(unique(passenger$SiblingNumber), 2)), SurvivalRate = as.vector(survivalRate))
+
+ggplot(plotData, aes(x = SiblingNumber, y = SurvivalRate, color = Sex)) + geom_line(size = 1)
+```
+
+We can see that the survival rate of women with 0, 1, or 2 siblings is almost equal, thereafter an increase of the number of siblings decreases the survival rate significantly. This decrease can also be seen for men, however the survival rate of men with exactly one sibling is clearly the highest. I suspect that the main reason why the survival rate decreases with the number of siblings is that the average number siblings of 3rd class passengers is clearly higher than that of 1st or 2nd class passengers.
+
+Finally, I want to analyse if the survival of the passengers' siblings effected the survival of the passenger itself. Therefore, I calculate the survival rate with respect to the difference of survived minus not survived siblings. Passengers without any siblings are excluded.
+
+```{r}
+passengerWithSibling <- passenger[passenger$SiblingNumber > 0, ]
+
+# survival rate with respect to sex, and siblings' survival difference
+survivalRate <- tapply(passengerWithSibling$Survived, list(passengerWithSibling$Sex, passengerWithSibling$SiblingSurvivedDiff), mean, na.rm = TRUE)
+
+plotData <- data.frame(Sex = factor(c("female", "male")), SiblingSurvivedDiff = sort(rep(unique(passengerWithSibling$SiblingSurvivedDiff), 2)), SurvivalRate = as.vector(survivalRate))
+# remove NA and NAN
+plotData <- plotData[!(is.na(plotData$SurvivalRate) | is.nan(plotData$SurvivalRate)), ]
+
+ggplot(plotData, aes(x = SiblingSurvivedDiff, y = SurvivalRate, color = Sex)) + geom_line(size = 1)
+
+```
+
+The chance of survival seems to increase with the number of survived siblings, however it is not so clear since there are some outliers: All women with a sibling survival difference of -2 survived where less than 50% survived with a difference of -1 and male passengers with a difference of -1 had a survival chance of more than 30% whereas all men with a difference of 0 did not survive. The reason for these outliers are most likely the low number passengers which were included in this analysis.
+
+<!-- (This may be a bit too much I better exclude it)
+As we saw that the passengers' sex has a big effect on the survival rate I split the siblings into sisters and brothers to see if we can get some more insights with these features.
+
+```{r, eval = FALSE}
+# initialise features
+passenger$BrotherNumber <- 0
+passenger$BrotherId <- NA
+passenger$BrotherSurvivedDiff <- NA
+passenger$SisterNumber <- 0
+passenger$SisterId <- NA
+passenger$SisterSurvivedDiff <- NA
+
+# get indexes of all passengers with siblings
+indexPassenger <- which(passenger$SiblingNumber > 0)
+for (iPassenger in indexPassenger){
+    # get passengers' siblings
+    sibling <- passenger[passenger$PassengerId %in% passenger$SiblingId[[iPassenger]], ]
+    # get brothers
+    brother <- sibling[sibling$Sex == "male", ]
+    # number of brothers
+    nBrother <- dim(brother)[1]
+    # check if passenger has brothers
+    if (nBrother > 0){
+        passenger$BrotherNumber[iPassenger] <- nBrother
+        passenger$BrotherId[iPassenger] <- list(brother$PassengerId)
+        passenger$BrotherSurvivedDiff[iPassenger] <- sum(brother$Survived == 1, na.rm = TRUE) - sum(brother$Survived == 0, na.rm = TRUE)
+    }
+    
+    # get sisters
+    sister <- sibling[sibling$Sex == "female", ]
+    # number of sisters
+    nSister <- dim(sister)[1]
+    # check if passenger has sisters
+    if (nSister > 0){
+        passenger$SisterNumber[iPassenger] <- nSister
+        passenger$SisterId[iPassenger] <- list(sister$PassengerId)
+        passenger$SisterSurvivedDiff[iPassenger] <- sum(sister$Survived == 1, na.rm = TRUE) - sum(sister$Survived == 0, na.rm = TRUE)
+    }        
+}
+```
+
+```{r, eval = FALSE}
+tapply(passenger$Survived, list(passenger$Sex, passenger$BrotherNumber > 0, passenger$SisterNumber > 0), mean, na.rm = TRUE)
+```
+
+This table shows the survival rate of male and female passengers with no siblings, only brothers, only sister, and brothers and sisters. We can see that the survival rate of passengers with brothers and sisters is significantly lower than average. To have brothers and sisters requires a higher number of siblings and we saw already before that the survival rate decreased with the number of siblings. Regarding female passengers we can see that the survival rate is quite independent to the fact whether they had no siblings, or only brother or only sisters aboard. However, for male passengers we can see that especially the survival rate of passengers with sisters is by 15% higher than the survival rate of passengers without siblings. I think the main reason why we can see a this increase is that passengers with siblings aboard or on average younger than passengers without siblings and that the survival rate of young male passengers is clearly higher than the survival rate of older male passengers.
+
+```{r, eval = FALSE}
+tapply(passenger$Age, list(passenger$Sex, passenger$SiblingNumber > 0), mean, na.rm = TRUE)
+tapply(passenger$Survived, list(passenger$Sex, passenger$Age > 15), mean, na.rm = TRUE)
+```
+
+-->
+
+# Children and Parents
+
+## Combining
+
+The last step of combining families is to define which passengers are child and parent. Therefore, the Parch feature is most important as it contains the sum of number of children and parents. The biggest challenge of this task is to define who is actually the child and who the parent. The Age feature would be a very important indicator for that, however this feature has quite a lot of missing values and, as we saw already, some age values are questionable. Hence, I first try to combine as many passengers as possible without using the Age feature and will only use this feature when there is no other possibility to find out who's the parent of whom is.
+
+```{r}
+# initialise new children/parents features
+passenger$ChildrenNumber <- 0
+passenger$ChildrenId <- c(NA)
+passenger$ParentsNumber <- 0
+passenger$ParentsId <- c(NA)
+```
+
+First, I try to find parents of passengers who clearly have no children on their own - these are passengers with the title Master or Miss. 
+
+```{r}
+# get all passengers who have parents but no children
+child <- subset(passenger, Parch > 0 & Title %in% c("Master", "Miss"))
+
+# number of children
+nChildren <- dim(child)[1]
+# get all potential parents
+parent <- subset(passenger, Parch > 0 & !Title %in% c("Master", "Miss"))
+```
+
+For each child I search now for passengers who have the same surname or original name, and whose Parch is smaller or equal the number of the child's siblings. The child's sibling will be excluded. Let's see if these requirements are already sufficient to make the correct matchings.
+
+```{r}
+for (iChild in 1:nChildren){
+    # get current child
+    childSelect <- child[iChild, ]
+    
+    # select potential parents
+    parentSelect <- subset(parent, (MaidenName == childSelect$MaidenName | Surname == childSelect$MaidenName) & Parch >= childSelect$SiblingNumber & !PassengerId %in% childSelect$SiblingId)
+    
+    if (dim(parentSelect)[1] == 0){next}
+    
+    child$ParentsNumber[iChild] <- dim(parentSelect)[1]
+    child$ParentsId[iChild] <- list(parentSelect$PassengerId)
+    
+    # get indexes of parents
+    indexParent <- which(parent$PassengerId %in% parentSelect$PassengerId)
+    for (iParent in indexParent) {
+        parent$ChildrenNumber[iParent] <- parent$ChildrenNumber[iParent] + 1   
+        childrenId <- c(parent$ChildrenId[[iParent]], childSelect$PassengerId)
+        parent$ChildrenId[iParent] <- list(c(childrenId[!is.na(childrenId)]))
+    }
+}
+
+# number of children
+nChildren
+# get number of correctly matched child - parent pairs
+sum(child$ParentsNumber == child$Parch)
+```
+
+Among the 145 children 134 seem to be correctly matched. These are the children that were not correctly matched:
+
+``` {r}
+kable(child[child$ParentsNumber != child$Parch, c("PassengerId", "Age", "Name", "Ticket", "Parch", "ParentsNumber", "ParentsId", "SiblingId")])
+```
+
+Let's have a look at the children with too many matched parents (first I print the table of the child and then the table of the parents it is matched to):
+
+```{r, results = 'asis'}
+library(knitr)
+library(xtable)
+# get indexes of children with too many matched parents
+indexChild = which(child$ParentsNumber > child$Parch)
+
+for (iChild in indexChild){
+    print(kable(child[iChild, c("PassengerId", "Age", "Sex", "Name", "Parch", "ParentsNumber", "ParentsId", "Ticket")], caption = "Child"))
+    print(kable(parent[parent$PassengerId %in% child$ParentsId[[iChild]], c("PassengerId", "Age", "Sex", "Name", "Parch", "ChildrenNumber", "ChildrenId", "Ticket", "SpouseId")], caption = "Parent"))
+}
+```
+
+For all these children the right parents can be found by comparing the tickets and checking that the parents are married with each other.
+
+```{r}
+# define function to remove children from parents
+removeChild <- function(parent, childId){
+    parent$ChildrenNumber <- parent$ChildrenNumber - 1
+    for (iParent in 1:dim(parent)[1]){
+        parent$ChildrenId[[iParent]] <- parent$ChildrenId[[iParent]][parent$ChildrenId[[iParent]] != childId]
+    }    
+    parent
+}
+
+# define function to remove parents from children
+removeParent <- function(child, parentId){
+    child$ParentsNumber <- child$ParentsNumber - length(parentId)
+    parentsId <- child$ParentsId[[1]]
+    child$ParentsId[[1]] <- parentsId[!parentsId %in% parentId]    
+    child
+}
+
+indexChild = which(child$ParentsNumber > child$Parch)
+for (iChild in indexChild){
+    # get parents of selected child
+    parentSelect <- parent[parent$PassengerId %in% child$ParentsId[[iChild]],]
+    
+    # check how many parents have a different ticket than the child
+    parentDifferentTicket <- parentSelect[parentSelect$Ticket != child$Ticket[iChild],]
+    
+    # remove parents with different ticket
+    if (dim(parentDifferentTicket)[1] > 0){
+        # get indexes of parent
+        indexParent <- which(parent$PassengerId %in% parentDifferentTicket$PassengerId)
+        # get ids of parents to be removed
+        parentRemoveId <- list(parentDifferentTicket$PassengerId)
+        
+        # remove reference of child from parent
+        parent[indexParent, ] <- removeChild(parent[indexParent, ], child$PassengerId[iChild])
+
+        # remove reference of parent from child
+        child[iChild, ] <- removeParent(child[iChild, ], parentRemoveId)
+    }
+    
+    # check if number of remaining parents matches child's Parch
+    if (child$ParentsNumber[iChild] == child$Parch[iChild]) {next}
+    
+    # select parents again
+    parentSelect <- parent[parent$PassengerId %in% child$ParentsId[[iChild]],]
+    
+    # get parents that are married
+    parentSelect$Married <- FALSE
+    for (iParent in 1:dim(parentSelect)[1]){
+        parentSelect$Married[iParent] <- parentSelect$SpouseId[iParent] %in% parentSelect$PassengerId
+    }
+
+    if (!all(parentSelect$Married)){    
+        # get index of selected parents which are not married
+        indexParent <- which(parent$PassengerId %in% parentSelect$PassengerId[!parentSelect$Married])
+        parentRemoveId <- parent$PassengerId[indexParent]
+
+        # remove reference of child from parent
+        parent[indexParent, ] <- removeChild(parent[indexParent, ], child$PassengerId[iChild])
+
+        # remove reference of parent from child
+        child[iChild, ] <- removeParent(child[iChild, ], parentRemoveId)
+    }
+}
+```
+
+Among the children with too few matched parents it is very difficult to find their parents. For Hedwig Frolicher, Marta Hiltunen, Helen Newsom, and Lyyli Silven I couldn't find any passengers with the same ticket, cabin, surname, or original name. Hence, I suspect that the Parch values of these passengers is wrong and set it to 0. Regarding Georgette Madill I could find some passengers who had the same ticket:
+
+```{r}
+kable(passenger[passenger$Ticket == "24160", c("PassengerId", "Age", "Name", "Parch", "ChildrenNumber", "ChildrenId", "Ticket", "Cabin")])
+```
+
+Mrs. Robert has also one Parch and is old enough to be Miss Madill's mother. Furthermore, I couldn't find any other passenger who could have been Mrs. Robert's child or parent. Hence, I assume that Miss Madill's mother is Mrs. Robert.
+
+```{r}
+# match Mrs. Robert to Miss Madill
+child$ParentsNumber[child$PassengerId == 690] <- 1
+child$ParentsId[child$PassengerId == 690] <- 780
+parent$ChildrenNumber[parent$PassengerId == 780] <- 1
+parent$ChildrenId[parent$PassengerId == 780] <- 690
+
+# correct Parch of all unmatched children
+child$Parch[child$ParentsNumber != child$Parch] <- 0
+
+# insert all child and parent into passenger data set
+for (iChild in 1:dim(child)[1]){
+    passenger[passenger$PassengerId == child$PassengerId[iChild], ] <- child[iChild, ]
+}
+for (iParent in 1:dim(parent)[1]){
+    passenger[passenger$PassengerId == parent$PassengerId[iParent], ] <- parent[iParent, ]
+}
+```
+
+Now I search for siblings of children who are not in the child data set, these should be mainly passengers with title Mr. Logically, these passengers have the same parents as their siblings, however they might have children on their own which means that their Parch value might be higher then their siblings'. 
+
+```{r}
+# get ids of all passengers who are not in the child data set, but have siblings in the child data set
+idChildSibling <- NULL
+for (iChild in 1:dim(child)[1]){
+    # get siblings
+    if (child$SiblingNumber[iChild] > 0){
+        # get sibling ids
+        siblingId <- child$SiblingId[[iChild]]
+        # get ids of silbings not in child data set
+        siblingId <- siblingId[!siblingId %in% child$PassengerId]
+        
+        if (length(siblingId) > 0){
+            idChildSibling <- c(idChildSibling, siblingId)
+        }
+    }
+}
+
+# remove duplicates
+idChildSibling <- unique(idChildSibling)
+length(idChildSibling)
+```
+
+There are 15 passengers that were not considered as child and have siblings in the child set. These passengers will get the same parents assigned as their siblings.
+
+```{r}
+# get passenger ids of all parents and children
+parentChildrenPassengerId <- c(parent$PassengerId, child$PassengerId)
+
+# rebuild passenger data set
+passenger <- rbind(child, parent, passenger[!passenger$PassengerId %in% parentChildrenPassengerId, ])
+
+for (iPassenger in idChildSibling){
+    # get index of passenger
+    indexPassenger <- which(passenger$PassengerId == iPassenger)
+    
+    # get passenger's siblings
+    siblingId <- passenger$SiblingId[indexPassenger]
+    
+    # select one sibling from child set
+    siblingSelect <- child[child$PassengerId %in% siblingId[[1]], ]
+    siblingSelect <- siblingSelect[1, ]
+    
+    # check of Parch number of selected passenger matches
+    if (passenger$Parch[indexPassenger] < siblingSelect$ParentsNumber){
+        # something is wrong: the passenger should have at least the Parch number as its sibling's parents number
+        print("Parch insufficient for passenger")
+        print(iPassenger)
+        # go to next passenger
+        next
+    }
+    
+    # copy parents from sibling to passenger
+    passenger$ParentsNumber[indexPassenger] <- siblingSelect$ParentsNumber
+    passenger$ParentsId[indexPassenger] <- siblingSelect$ParentsId
+    
+    # match child to parents
+    # get indexes of parents
+    indexParent <- which(passenger$PassengerId %in% siblingSelect$ParentsId[[1]])
+    for (iParent in indexParent) {
+        passenger$ChildrenNumber[iParent] <- passenger$ChildrenNumber[iParent] + 1   
+        childrenId <- c(passenger$ChildrenId[[iParent]], passenger$PassengerId[indexPassenger])
+        passenger$ChildrenId[iParent] <- list(c(childrenId[!is.na(childrenId)]))
+    }    
+}
+```
+
+Among the found parents I search for passengers who have parents on their own. 
+
+```{r}
+parentWithParent <- subset(passenger, ChildrenNumber > 0 & Parch > ChildrenNumber + ParentsNumber)
+kable(parentWithParent[, c("PassengerId", "Name", "Age", "Parch", "Ticket", "ChildrenNumber", "ChildrenId")])
+```
+
+It seems that among these passengers only Mrs. Hamaleinen has either a missing child or parent. Unfortunately I couldn't find no one either. Hence, I assume that her Parch value is wrong and set it to 1.
+
+```{r}
+# correct Parch for Mrs. Hamalainen
+passenger$Parch[passenger$PassengerId == 248] <- 1
+```
+
+Let's see how many passengers with unmatched children/parents are left and check if all of them have an age value:
+
+```{r}
+iUnmatch <- passenger$Parch > passenger$ChildrenNumber + passenger$ParentsNumber
+sum(iUnmatch)
+sum(is.na(passenger$Age[iUnmatch]))
+```
+
+37 are left and luckily all of them have an age value, so I will use the age for the remaining ones to find out who's the parent of whom.
+
+```{r, results = 'asis'}
+# number of matches
+nMatch <- 0
+
+# define functions to add parent or child to passenger via passenger ids
+addParent <- function(childId, parentId){
+    iChild <- which(passenger$PassengerId == childId)
+    
+    if (!parentId %in% passenger$ParentsId[[iChild]]){
+        passenger$ParentsNumber[iChild] <- passenger$ParentsNumber[iChild] + 1
+        parentsId <- c(passenger$ParentsId[[iChild]], parentId)
+        passenger$ParentsId[iChild] <- list(c(parentsId[!is.na(parentsId)]))
+    }
+    
+    passenger
+}
+addChild <- function(parentId, childId){
+    iParent <- which(passenger$PassengerId == parentId)
+    
+    if (!childId %in% passenger$ChildrenId[[iParent]]){
+        passenger$ChildrenNumber[iParent] <- passenger$ChildrenNumber[iParent] + 1
+        childrenId <- c(passenger$ChildrenId[[iParent]], childId)
+        passenger$ChildrenId[iParent] <- list(c(childrenId[!is.na(childrenId)]))
+    }
+    
+    passenger
+}
+
+for (iPassenger in which(iUnmatch)){
+    # select passenger
+    passengerSelect <- passenger[iPassenger, ]
+    # get all siblings, parents, children, and spouse ids of selected passenger
+    familyId <- c(passengerSelect$SiblingId[[1]], passengerSelect$ParentsId[[1]], passengerSelect$ChildrenId[[1]], passengerSelect$SpouseId[[1]])
+    # remove NAs
+    familyId <- familyId[!is.na(familyId)]
+    
+    passengerMatch <- 0
+    
+    # get potential parents
+    parent <- subset(passenger, Surname == passengerSelect$MaidenName & Age >= passengerSelect$Age + 18 &  !PassengerId %in% familyId)
+    
+    if (dim(parent)[1] > 0){
+        print(kable(passengerSelect[, c("PassengerId", "Name", "Age", "Parch", "ParentsNumber", "ChildrenNumber", "SpouseNumber", "SiblingNumber", "Ticket")], caption = "Child"))
+        print(kable(parent[, c("PassengerId", "Name", "Age", "Parch", "ParentsNumber", "ChildrenNumber", "SpouseNumber", "SiblingNumber", "Ticket")], caption = "matches to parent(s):"))
+        passengerMatch <- 1
+        
+        # match passengers
+        for (iMatch in 1:dim(parent)[1]){
+            # check if passengers were matched already
+            if (parent$PassengerId[iMatch] %in% passengerSelect$ParentsId[[1]]){
+                # passengers were matched already
+                next
+            }
+            
+            # add parent to selected passenger
+            passenger <- addParent(passengerSelect$PassengerId, parent$PassengerId[iMatch])
+            # add selected passenger to parent
+            passenger <- addChild(parent$PassengerId[iMatch], passengerSelect$PassengerId)
+        }
+    }
+    
+    # get potential children
+    child <- subset(passenger, MaidenName == passengerSelect$Surname & Age <= passengerSelect$Age - 18 &  !PassengerId %in% familyId)
+    
+    if (dim(child)[1] > 0){
+        print(kable(passengerSelect[, c("PassengerId", "Name", "Age", "Parch", "ParentsNumber", "ChildrenNumber", "SpouseNumber", "SiblingNumber", "Ticket")], caption = "Parent:"))
+        print(kable(child[, c("PassengerId", "Name", "Age", "Parch", "ParentsNumber", "ChildrenNumber", "SpouseNumber", "SiblingNumber", "Ticket")], caption = "matches to child/children:"))
+        passengerMatch <- 1
+        
+        # match passengers
+        for (iMatch in 1:dim(child)[1]){
+            # check if passengers were matched already
+            if (child$PassengerId[iMatch] %in% passengerSelect$ChildrenId[[1]]){
+                # passengers were matched already
+                next
+            }
+            
+            # add child to selected passenger
+            passenger <- addParent(child$PassengerId[iMatch], passengerSelect$PassengerId)
+            # add selected passenger to child
+            passenger <- addChild(passengerSelect$PassengerId, child$PassengerId[iMatch])  
+        }
+    }    
+    # update number of matches
+    nMatch <- nMatch + passengerMatch
+}
+nMatch
+```
+
+There are some mismatches which I correct by hand (the numbers in brackets are the passenger Ids):
+
+- Mrs. Baxter (300, Parch == 1) seems to have two children (119, 1076) 
+- Margaret Hays (311, Parch == 0) is not child of Charles and Clara Hays (1200, 821)
+- Arthur Newell (660) father of Madeleine and Marjorie Newell (216, 394 both Parch == 0)
+- Richard White (103 Parch == 1) is not child of Ella White (1206, Parch == 0)
+
+```{r}
+
+# Baxter
+passenger$Parch[passenger$PassengerId == 300] <- 2
+
+# Hayes
+iParent <- which(passenger$PassengerId %in% c(1200, 821))
+parent <- passenger[iParent, ]
+parent <- removeChild(parent, 311)
+passenger[iParent, ] <- parent
+iChild <- which(passenger$PassengerId == 311)
+child <- passenger[iChild, ]
+child <- removeParent(child, c(1200, 821))
+passenger[iChild, ] <- child
+
+# Newell
+passenger$Parch[passenger$PassengerId %in% c(216, 394)] <- 1
+
+# White
+iParent <- which(passenger$PassengerId == 1206)
+parent <- passenger[iParent, ]
+parent <- removeChild(parent, 103)
+passenger[iParent, ] <- parent
+iChild <- which(passenger$PassengerId == 103)
+child <- passenger[iChild, ]
+child <- removeParent(child, 1206)
+passenger[iChild, ] <- child
+```
+
+Now there are only nine passengers left for whom I couldn't find any children or parents:
+
+```{r}
+iUnmatch <- passenger$Parch > passenger$ChildrenNumber + passenger$ParentsNumber
+kable(passenger[iUnmatch, c("PassengerId", "Name", "Age", "Parch", "ParentsNumber", "ChildrenNumber", "SpouseNumber", "SpouseId", "SiblingNumber", "Ticket")])
+```
+
+Here I believe that Mrs. Parrish (260) is the mother of Mrs. Shelley (881) as Mrs. Shelley's maiden name is Parrish Hall and both had the same ticket number. For the remaining passengers I could not find any matches by searching for equal tickets, surnames, or maiden names. Hence, I assume that their Parch feature is wrong and set it to 0.
+
+```{r}
+
+# match Mrs. Parrish and Mrs. Shelley
+passenger <- addChild(260, 881)
+passenger <- addParent(881, 260)
+
+# correct Parch of all remaining unmatched passengers
+passenger$Parch[passenger$PassengerId %in% c(249, 872, 588, 1289, 313, 1041, 274)] <- 0
+
+```
+
+The matching of families (spouse, siblings, children, and parents) is completed. Now I check that all numbers of family members match with the ids and that there are no duplicate ids.
+
+```{r}
+# ids of passengers with double assigned family members
+passengerIdNotUnique <- NULL
+# ids of passengers which have a mismatch of the number of family members and the number of matched ids
+passengerNumberMismatch <- NULL
+
+
+# check that each passenger has different spouses, siblings, parents, and children
+for (iPassenger in 1:dim(passenger)[1]){
+    passengerSelect <- passenger[iPassenger, ]
+    
+    # combine ids of all family members
+    familyId <- c(passengerSelect$SpouseId[[1]], passengerSelect$SiblingId[[1]], passengerSelect$ChildrenId[[1]], passengerSelect$ParentsId[[1]])
+    # remove NAs
+    familyId <- familyId[!is.na(familyId)]
+    
+    # get number of family members
+    nMember <- length(familyId)
+    # get number of unique family members
+    nMemberUnique <- length(unique(familyId))
+    
+    # check that numbers are the same
+    if (nMember != nMemberUnique){
+        passengerIdNotUnique <- c(passengerIdNotUnique, passengerSelect$PassengerId)
+    }
+    
+    # check that all numbers are correct
+    if (passengerSelect$SpouseNumber != sum(!is.na(passengerSelect$SpouseId[[1]])) || 
+        passengerSelect$SiblingNumber != sum(!is.na(passengerSelect$SiblingId[[1]])) || 
+        passengerSelect$ChildrenNumber != sum(!is.na(passengerSelect$ChildrenId[[1]])) ||
+        passengerSelect$ParentsNumber != sum(!is.na(passengerSelect$ParentsId[[1]]))) {
+        passengerNumberMismatch <- c(passengerNumberMismatch, passengerSelect$PassengerId)
+    } 
+}
+
+```
+
+There are a few passengers left which parch number is not the sum of the number of children and parents:
+
+```{r}
+parchMismatch <- passenger$Parch != passenger$ParentsNumber + passenger$ChildrenNumber
+kable(passenger[parchMismatch, c("PassengerId", "Name", "Age", "Ticket", "Cabin", "Parch", "ParentsNumber", "ChildrenNumber", "ParentsId", "ChildrenId", "SpouseId", "SiblingId")])
+
+```
+
+We had a look at the Andersson family already and didn't match Erna and Ida Andersson (69, 1106) with the other Andersson siblings. Now they were matched as children to Johan and Alfrida Andersson(611, 14) which does not make sense so I remove them.
+
+```{r}
+iParent <- passenger$PassengerId %in% c(14, 611)
+passenger$ChildrenNumber[iParent] <- 5
+passenger$ChildrenId[iParent] <- list(c(851, 814, 120, 542, 543))
+
+iChild <- passenger$PassengerId %in% c(69, 1106)
+passenger$ParentsNumber[iChild] <- 0
+passenger$Parch[iChild] <- passenger$Parch[iChild] - 2
+passenger$ParentsId[iChild] <- NA
+
+```
+
+Regarding the Grahams it could be that Edith Graham (269) is the mother of Georg Graham (333) and the grand mother of Margaret Graham (888) and Georg Graham could be Margaret Grahams father. However, Margaret had a different ticket than George and Edith (who had the same ticket) and their Parch numbers also disapproves this theory. Because of that, I assumed that they are not relatives and remove Margaret as child of George and Edith.
+
+```{r}
+# George Graham
+iParent <- passenger$PassengerId == 333
+passenger$ChildrenNumber[iParent] <- 0
+passenger$ChildrenId[iParent] <- NA
+# Edith Graham
+iParent <- passenger$PassengerId == 269
+passenger$ChildrenNumber[iParent] <- 1
+passenger$ChildrenId[iParent] <- 333
+# Margaret Graham
+iChild <- passenger$PassengerId == 888
+passenger$ParentsNumber[iChild] <- 0
+passenger$ParentsId[iChild] <- NA
+
+```
+
+As Charles and Leslie Williams (156, 736) had different tickets as well I assume that they were related either:
+
+```{r}
+# Charles Williams
+iParent <- passenger$PassengerId == 156
+passenger$ChildrenNumber[iParent] <- 1
+passenger$ChildrenId[iParent] <- 915
+# Leslie Williams
+iChild <- passenger$PassengerId == 736
+passenger$ParentsNumber[iChild] <- 0
+passenger$ParentsId[iChild] <- NA
+```
+
+## Survival Analysis
+
+Now I have a look on the survival of parents and children. First, I check if there is a correlation between the number of parents / children and the passengers' survival rate.
+
+```{r}
+library(gridExtra)
+
+# survival rate of passengers with respect to the number of children
+survivalRateParents <- tapply(passenger$Survived, list(passenger$Sex, passenger$ChildrenNumber), mean, na.rm = TRUE)
+# survival rate of passenger with respect to the number of parents
+survivalRateChildren <- tapply(passenger$Survived, list(passenger$Sex, passenger$ParentsNumber), mean, na.rm = TRUE)
+
+plotParents <- data.frame(sex = factor(c("female", "male")), childrenNumber = sort(rep(unique(passenger$ChildrenNumber), 2)), survivalRate = as.vector(survivalRateParents))
+# remove NA and NaN
+plotParents <- plotParents[!(is.na(plotParents$survivalRate)) & !(is.nan(plotParents$survivalRate)), ]
+
+plotChildren <- data.frame(sex = factor(c("female", "male")), parentsNumber = sort(rep(unique(passenger$ParentsNumber), 2)), survivalRate = as.vector(survivalRateChildren))
+# remove NA and NaN
+plotChildren <- plotChildren[!(is.na(plotChildren$survivalRate)) & !(is.nan(plotChildren$survivalRate)), ]
+
+p1 <- ggplot(plotParents, aes(x = childrenNumber, y = survivalRate, color = sex))+ geom_line(size = 1) + ggtitle("Survival of Parents")
+             
+p2 <- ggplot(plotChildren, aes(x = parentsNumber, y = survivalRate, color = sex))+ geom_line(size = 1) + ggtitle("Survival of Children")             
+             
+grid.arrange(p1, p2, nrow = 2, ncol = 1)
+```
+
+In case of passengers with children we can see that the survival rate of women with children is higher than that of women without children, whereas in case of men its exactly the opposite: men without children were more likely to survive than men with children. 
+Regarding passengers with parents aboard we can see that the survival rate of women decreased with the number of parents whereas the survival rate of male passenger increases by 27% between no parents and one parent. Most likely the reason for that is that passengers with parents were younger than passengers without parents and that young male passengers had clearly higher survival rates than older male passengers.
+
+To analyse whether there is a correlation between the survival of parents and children I add the features ChildrenSurvivedDiff and ParentsSurvivedDiff which are defined as the number of survived parents/children minus the number of parents/children who did not survive. 
+
+```{r}
+passenger$ChildrenSurvivedDiff <- 0
+passenger$ParentsSurvivedDiff <- 0
+for (iPassenger in 1:dim(passenger)[1]){
+    # calculate survival difference of children
+    if (passenger$ChildrenNumber[iPassenger] > 0){
+        # get number of survived children
+        nChildrenSurvived <- sum(passenger$Survived[passenger$PassengerId %in% passenger$ChildrenId[[iPassenger]]])
+        passenger$ChildrenSurvivedDiff[iPassenger] <- 2 * nChildrenSurvived - passenger$ChildrenNumber[iPassenger]
+    }
+    # calculate survival difference of parents
+    if (passenger$ParentsNumber[iPassenger] > 0){
+        # get number of survived children
+        nParentsSurvived <- sum(passenger$Survived[passenger$PassengerId %in% passenger$ParentsId[[iPassenger]]])
+        passenger$ParentsSurvivedDiff[iPassenger] <- 2 * nParentsSurvived - passenger$ParentsNumber[iPassenger]
+    }    
+}
+
+# get survival rate with respect to difference of survived children/parents
+passengerWithChildren <- passenger[passenger$ChildrenNumber > 0, ]
+passengerWithParents <- passenger[passenger$ParentsNumber > 0, ]
+
+# survival rate of passengers with respect to the number of survived children
+survivalRateParents <- tapply(passengerWithChildren$Survived, list(passengerWithChildren$Sex, passengerWithChildren$ChildrenSurvivedDiff), mean, na.rm = TRUE)
+# survival rate of passenger with respect to the number of parents
+survivalRateChildren <- tapply(passengerWithParents$Survived, list(passengerWithParents$Sex, passengerWithParents$ParentsSurvivedDiff), mean, na.rm = TRUE)
+
+plotParents <- data.frame(sex = factor(c("female", "male")), childrenSurvivedDiff = sort(rep(unique(passenger$ChildrenSurvivedDiff), 2)), survivalRate = as.vector(survivalRateParents))
+# remove NA and NaN
+plotParents <- plotParents[!(is.na(plotParents$survivalRate)) & !(is.nan(plotParents$survivalRate)), ]
+
+plotChildren <- data.frame(sex = factor(c("female", "male")), parentsSurvivedDiff = sort(rep(unique(passenger$ParentsSurvivedDiff), 2)), survivalRate = as.vector(survivalRateChildren))
+# remove NA and NaN
+plotChildren <- plotChildren[!(is.na(plotChildren$survivalRate)) & !(is.nan(plotChildren$survivalRate)), ]
+
+p1 <- ggplot(plotParents, aes(x = childrenSurvivedDiff, y = survivalRate, color = sex))+ geom_line(size = 1) + ggtitle("Survival of Parents")
+             
+p2 <- ggplot(plotChildren, aes(x = parentsSurvivedDiff, y = survivalRate, color = sex))+ geom_line(size = 1) + ggtitle("Survival of Children")             
+             
+grid.arrange(p1, p2, nrow = 2, ncol = 1)
+```
+
+The results show that there is a strong correlation between the survival of female passengers and the survival of their children. All mothers who had more survived than not survived children survived as well, whereas mothers with more not survived than survived children were very unlikely to survived. For male passenger we can see the same trend, however their survival rate does not increase as much as that of women since the survival rate of male passengers is lower in general. 
+Regarding the survival rate of children with respect to the number of survived parents we can see that their survival rates are strongly correlated with the survival of their parents. Almost all passengers who had at least one parent who survived survived as well. 
+
+To conclude the section I have a look whether it made a difference if the passengers' father or mother survived. Therefore, I create the features FatherSurvived and MotherSurvived.
+
+```{r}
+passenger$FatherSurvivedDiff <- 0
+passenger$FatherNumber <- 0
+passenger$MotherSurvivedDiff <- 0
+passenger$MotherNumber <- 0
+
+for (iPassenger in which(passenger$ParentsNumber > 0)) {
+    
+    for (iParent in which(passenger$PassengerId %in% passenger$ParentsId[[iPassenger]])) {
+        # get sex of parent
+        if (passenger$Sex[iParent] == "female"){
+            # parent is mother
+            passenger$MotherSurvivedDiff[iPassenger] <- 2 * passenger$Survived[iParent] - 1
+            passenger$MotherNumber[iPassenger] <- 1
+        } else {
+            # parent is father
+            passenger$FatherSurvivedDiff[iPassenger] <- 2 * passenger$Survived[iParent] - 1
+            passenger$FatherNumber[iPassenger] <- 1
+        }
+    }
+}
+
+# get survival rate of passengers with father or mother
+passengerWithFather <- passenger[passenger$FatherNumber == 1, ]
+passengerWithMother <- passenger[passenger$MotherNumber == 1, ]
+survivalRateFather <- tapply(passengerWithFather$Survived, list(passengerWithFather$Sex, passengerWithFather$FatherSurvivedDiff), mean, na.rm = TRUE)
+survivalRateMother <- tapply(passengerWithMother$Survived, list(passengerWithMother$Sex, passengerWithMother$MotherSurvivedDiff), mean, na.rm = TRUE)
+
+plotData <- data.frame(sex = factor(c("female", "male")), parentSurvived = (c("Father not survived", "Father not survived", "Father survived", "Father survived", "Mother not survived", "Mother not survived", "Mother survived", "Mother survived")), survivalRate = as.vector(c(survivalRateFather, survivalRateMother)))
+
+ggplot(plotData, aes(x = parentSurvived, y = survivalRate, fill = sex)) + geom_bar(stat = "identity", position = position_dodge())
+```
+
+Here we can see that the survival of the mother is much more important than the survival of the father. Around half of the passengers whose father didn't survived survived whereas almost all passengers whose mother didn't survive did not survive as well. 
+
+# Survival of relatives
+
+Finally, I have a look at the survival rate of passenger with respect to the survival of their relatives. Hereby, I sum up the survival difference of spouses, siblings, children, and parents:
+
+```{r}
+passenger$RelativesSurvivedDiff <- passenger$SiblingSurvivedDiff + passenger$ChildrenSurvivedDiff + passenger$ParentsSurvivedDiff + passenger$SpouseSurvivedDiff
+
+# get passengers with relatives
+passengerWithRelatives <- passenger[passenger$SibSp + passenger$Parch > 0, ]
+survivalRate <- tapply(passengerWithRelatives$Survived, list(passengerWithRelatives$Sex, passengerWithRelatives$RelativesSurvivedDiff), mean, na.rm = TRUE)
+
+plotData <- data.frame(sex = factor(c("female", "male")), relativesSurvivedDiff = sort(rep(unique(passenger$RelativesSurvivedDiff), 2)), survivalRate = as.vector(survivalRate))
+# remove NA and NaN
+plotData <- plotData[!is.na(plotData$survivalRate) & !is.nan(plotData$survivalRate), ]
+
+ggplot(plotData, aes(x = relativesSurvivedDiff, y = survivalRate, color = sex)) + geom_line(size = 1)
+```
+
+There seem to be some statistical fluctuations which makes the survival of females with -3 survived relatives much more likely than with -2. However, we can see a trend that the more relatives survived the more likely the respective passenger was to survive as well.
+
+# Discussion
+
+We've seen some clear correlation among survival rates among related passengers. Although not all passengers had relatives aboard I think it should be possible to use these relations to predict the survival of all passengers more accurately. We saw for example that all women whose husbands survived survived as well and that all men whose wifes did not survive also did not survive. Since these results are so clear one could even consider using this criteria only to predict the survival of the respective passengers. 
+
+When we want to use the survival information of related passengers to predict the survival of the respective passengers we will run into the problem that the survival of the related passengers might be unknown as they are in the test data set as well. One way to overcome this problem could be to first use any prediction algorithm which does not need this information to make predictions. Afterwards, an iterative prediction algorithm could be used which uses the predictions of the survival of the previous iteration.
+
+I would be glad to get some opinions about that and also to get some more ideas how the relatives relations could be used as well. I hope some people will use the data set I created and play around with it. 
+
+```{r}
+# create output file
+passengerOutput <- passenger
+
+# replace empty integers by NA
+passengerOutput$SpouseId[sapply(passenger$SpouseId, length) == 0] <- NA
+passengerOutput$SiblingId[sapply(passenger$SiblingId, length) == 0] <- NA
+passengerOutput$ChildrenId[sapply(passenger$ChildrenId, length) == 0] <- NA
+passengerOutput$ParentsId[sapply(passenger$ParentsId, length) == 0] <- NA
+
+# replace lists by comma separated strings
+for (i in 1:dim(passengerOutput)[1]){
+    if (passengerOutput$SiblingNumber[i] > 1){
+        passengerOutput$SiblingId[i] <- paste(as.character(passengerOutput$SiblingId[[i]]), collapse = ";") 
+    }
+    if (passengerOutput$ChildrenNumber[i] > 1){
+        passengerOutput$ChildrenId[i] <- paste(as.character(passengerOutput$ChildrenId[[i]]), collapse = ";")
+    }
+    if (passengerOutput$ParentsNumber[i] > 1){
+        passengerOutput$ParentsId[i] <- paste(as.character(passengerOutput$ParentsId[[i]]), collapse = ";")
+    }    
+}
+
+# convert lists to characters
+passengerOutput$SpouseId <- as.character(passengerOutput$SpouseId)
+passengerOutput$SiblingId <- as.character(passengerOutput$SiblingId)
+passengerOutput$ChildrenId <- as.character(passengerOutput$ChildrenId)
+passengerOutput$ParentsId <- as.character(passengerOutput$ParentsId)
+
+# order by passenger id
+passengerOutput <- passengerOutput[order(passengerOutput$PassengerId), ]
+
+# save passenger data set
+write.csv(passengerOutput, file = "passengerFamily.csv")
+```
+
