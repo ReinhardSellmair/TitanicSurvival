@@ -1,6 +1,8 @@
 # TitanicSurvival
 Predict survival of Titanic passengers
 
+![Titanic](https://github.com/ReinhardSellmair/TitanicSurvival/blob/master/Titanic.PNG)
+
 This repository contains all R Markdown files I wrote for the Kaggle Titanic challenge https://www.kaggle.com/c/titanic.
 Kaggle account: https://www.kaggle.com/reisel
 
